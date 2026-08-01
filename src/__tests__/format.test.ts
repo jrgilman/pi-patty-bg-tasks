@@ -5,8 +5,10 @@
 import { describe, it, test } from "node:test";
 import assert from "node:assert/strict";
 import {
+    describeJob,
     formatDuration,
     formatJobLine,
+    oneLine,
     statusLabel,
     truncateTail,
 } from "../format.ts";
@@ -85,6 +87,27 @@ test("statusLabel distinguishes foreground and background", () => {
     assert.ok(statusLabel(bg).includes("bg"));
 });
 
+void describe("oneLine", () => {
+    void it("collapses whitespace runs and trims", () => {
+        assert.equal(oneLine("  make\n\tall  "), "make all");
+    });
+});
+
+void describe("describeJob", () => {
+    void it("prefers the job name", () => {
+        assert.equal(describeJob("build", "make all"), "build");
+    });
+    void it("falls back to the command, collapsed to one line", () => {
+        assert.equal(describeJob(undefined, "make\nall"), "make all");
+    });
+    void it("truncates a long command", () => {
+        const long = "x".repeat(120);
+        const out = describeJob(undefined, long);
+        assert.equal(out.length, 81);
+        assert.ok(out.endsWith("…"));
+    });
+});
+
 void describe("formatJobLine", () => {
     void it("running jobs show duration", () => {
         const job: Job = {
@@ -97,7 +120,7 @@ void describe("formatJobLine", () => {
             toolCallId: "tc-1",
             isBackgrounded: true,
         };
-        assert.match(formatJobLine(job), /^job-1-1: sleep 60 - ▶ bg \(5s\) \(5s\)$/);
+        assert.match(formatJobLine(job), /^job-1-1 \[shell\]: sleep 60 - ▶ bg \(5s\) \(5s\)$/);
     });
     void it("named jobs show the name first", () => {
         const job: Job = {
@@ -111,6 +134,18 @@ void describe("formatJobLine", () => {
             toolCallId: "tc-1",
             isBackgrounded: false,
         };
-        assert.match(formatJobLine(job), /^build \(job-1-2\):/);
+        assert.match(formatJobLine(job), /^build \(job-1-2\) \[shell\]:/);
+    });
+    void it("terminal jobs render their status label", () => {
+        const job = makeJob({ status: "completed" });
+        assert.match(formatJobLine(job), /✓ completed$/);
+    });
+    void it("failed terminal jobs render the failed label", () => {
+        const job = makeJob({ status: "failed", notified: true });
+        assert.match(formatJobLine(job), /✗ failed$/);
+    });
+    void it("running jobs show the bg label", () => {
+        const job = makeJob({ status: "running", isBackgrounded: true });
+        assert.ok(formatJobLine(job).includes("▶ bg"));
     });
 });

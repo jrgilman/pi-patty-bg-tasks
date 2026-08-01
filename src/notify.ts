@@ -1,239 +1,147 @@
 /**
- * Coalesced background-job notices.
+ * Task-completion notifications — Claude Code's <task-notification> engine.
  *
- * Background jobs and monitors finish at all sorts of times during a long agent
- * turn. Sent individually, their notices queue in Pi and dump as a WALL after
- * the agent's next reply — "10 [job-finished] lines all at once, long after they
- * finished." So instead we accumulate every completion + monitor-terminal notice
- * and flush ONE summary. Mid-turn, the flush fires at **agent_end** as a passive
- * follow-up so a whole turn's worth collapses into one line without spawning an
- * unsolicited follow-up turn. While the agent is idle, a short fallback timer
- * coalesces and flushes instead — AND wakes the agent via a steer, because the
- * user isn't engaged and the banner alone won't get the agent to react.
+ * Every backgrounded job that reaches a terminal state enqueues its OWN
+ * <task-notification> XML message, exactly once, the moment it exits. There
+ * is no hold-and-flush and no coalescing window: pi's steer delivery queues
+ * the message while the agent is streaming and delivers it at the next
+ * tool-call boundary (CC's 'next' priority), or starts a turn when the agent
+ * is idle (triggerTurn: true).
  *
- * Monitor *stream* events (matched log lines) are NOT routed here — they carry
- * data the agent is actively watching and stay live. Only the terminal/status
- * notices (stream ended / stopped / failed) and job completions coalesce.
- *
- * Jobs whose output was already consumed (e.g. via a jobs attach) never enqueue.
+ * Exactly-once is enforced by the job's `notified` latch — a check-and-set
+ * done BEFORE the send, so any path that already surfaced the outcome (a
+ * jobs output/attach read, a deliberate kill) suppresses the notification.
+ * A terminal job that has been notified is evicted from the live registry;
+ * its output log stays on disk and the notification carries the path.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-    DELIVER_FOLLOWUP,
-    DELIVER_STEER,
-    EVENT,
-    JOB_FINISH_COALESCE_MS,
-    type Job,
-    type MonitorEnd,
-    type UiContext,
-} from "./types.ts";
+import { DELIVER_STEER, EVENT, type Job } from "./types.ts";
 import type { BackgroundRegistry } from "./state.ts";
-import { formatNotices } from "./notice.ts";
+import { forget } from "./registry.ts";
+import { describeJob } from "./format.ts";
 
-/** Queue a finished job for the next coalesced notice. */
-export function enqueueFinished(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext,
-    job: Job
-): void {
-    if (job.outputConsumed) return; // already surfaced via attach
-    // Stamp the finish time now (≈ completion) so the reported duration isn't
-    // inflated by however long the notice waits for the turn boundary.
-    job.endedAt ??= Date.now();
-    reg.pendingFinished.push(job);
-    armIdleFlush(reg, pi, ctx);
-}
+/** Terminal statuses a <task-notification> can carry. */
+export type TerminalStatus = "completed" | "failed" | "killed";
 
-/** Queue a monitor's terminal notice (stream ended / stopped / failed). */
-export function enqueueMonitorEnd(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext,
-    end: MonitorEnd
-): void {
-    reg.pendingMonitorEnds.push(end);
-    armIdleFlush(reg, pi, ctx);
+/** Escape the XML special characters CC escapes inside element text. */
+export function escapeXml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /**
- * Arm the fallback flush — but ONLY while the agent is idle. Mid-turn, notices
- * accumulate and flush together at agent_end (see noteAgentEnd), so a long turn
- * full of finishes yields one summary instead of a wall.
+ * Build Claude Code's exact <task-notification> XML block. The <tool_use_id>
+ * line is included only when a toolUseId is present; the <status> line is
+ * omitted deliberately for stall warnings (CC parity).
  */
-function armIdleFlush(reg: BackgroundRegistry, pi: ExtensionAPI, ctx: UiContext): void {
-    if (reg.agentBusy) return;
-    if (reg.noticeFlushTimer) return;
-    const timer = setTimeout(
-        () => flushIdleNotices(reg, pi, ctx),
-        JOB_FINISH_COALESCE_MS
-    );
-    (timer as NodeJS.Timeout).unref();
-    reg.noticeFlushTimer = timer;
+export function buildTaskNotification(args: {
+    taskId: string;
+    toolUseId?: string;
+    outputFile: string;
+    status?: TerminalStatus;
+    summary: string;
+}): string {
+    const lines = [
+        "<task-notification>",
+        `<task_id>${escapeXml(args.taskId)}</task_id>`,
+        ...(args.toolUseId ? [`<tool_use_id>${escapeXml(args.toolUseId)}</tool_use_id>`] : []),
+        `<output_file>${escapeXml(args.outputFile)}</output_file>`,
+        ...(args.status ? [`<status>${args.status}</status>`] : []),
+        `<summary>${escapeXml(args.summary)}</summary>`,
+        "</task-notification>",
+    ];
+    return lines.join("\n");
 }
 
 /**
- * Agent started a turn: drain anything still pending (in case a previous turn
- * threw before its agent_end and stranded notices), then hold new notices until
- * this turn ends. The drain is a no-op on the happy path (buffers empty).
- * Drain path uses the turn-boundary shape (no wake) — a stranded batch from a
- * prior turn should not autonomously start a new turn.
+ * Claude Code's exact completion summary for a terminal job. `status`
+ * overrides job.status for callers that notify before the job is marked
+ * terminal (the monitor exit path).
  */
-export function noteAgentStart(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext
-): void {
-    flushTurnBoundaryNotices(reg, pi, ctx);
-    reg.agentBusy = true;
-    clearFlushTimer(reg);
+export function completionSummary(job: Job, status?: TerminalStatus): string {
+    const s = status ?? (job.status as TerminalStatus);
+    const desc = describeJob(job.name, job.command);
+    if (job.kind === "monitor") {
+        if (s === "killed") return `Monitor "${desc}" stopped`;
+        if (s === "failed") return `Monitor "${desc}" script failed (exit ${job.exitCode ?? "unknown"})`;
+        return `Monitor "${desc}" stream ended`;
+    }
+    if (job.kind === "agent") {
+        if (s === "killed") return `Agent "${desc}" was stopped`;
+        if (s === "failed") {
+            return `Agent "${desc}" failed: ${job.exitCode !== undefined ? `exit code ${job.exitCode}` : "unknown error"}`;
+        }
+        return `Agent "${desc}" completed`;
+    }
+    if (s === "killed") return `Background command "${desc}" was stopped`;
+    if (s === "failed") return `Background command "${desc}" failed with exit code ${job.exitCode ?? "unknown"}`;
+    return `Background command "${desc}" completed${job.exitCode != null ? ` (exit code ${job.exitCode})` : ""}`;
 }
 
-/** Agent finished a turn: flush everything that accumulated as one summary.
- *  Uses the turn-boundary shape (no wake) — waking here would spawn an
- *  unsolicited follow-up turn that defeats coalescing. */
-export function noteAgentEnd(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext
-): void {
-    reg.agentBusy = false;
-    flushTurnBoundaryNotices(reg, pi, ctx);
+/**
+ * Set the notified latch (Claude Code's markTaskNotified). Idempotent. Called
+ * by every path that surfaces a job's outcome WITHOUT the notification: kill
+ * paths (before the kill, so the exit handler skips notifying) and terminal
+ * reads (jobs output / attach).
+ */
+export function markNotified(job: Job): void {
+    job.notified = true;
 }
 
-/** Idle-path flush: wakes the agent via a steer so the agent actually reacts
- *  to the finished job (the user isn't engaged to prompt otherwise). */
-export function flushIdleNotices(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext
-): void {
-    sendCoalescedNotice(reg, pi, ctx, DELIVER_STEER);
-}
-
-/** Turn-boundary flush: passive follow-up. No wake — the agent just finished
- *  a turn and waking here would spawn an unsolicited follow-up turn. */
-export function flushTurnBoundaryNotices(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext
-): void {
-    sendCoalescedNotice(reg, pi, ctx, DELIVER_FOLLOWUP);
-}
-
-/** Shared flush body. Drains the pending buffers and emits the notice. If
- *  either `notify` or `sendMessage` throws (typically a stale ctx after a
- *  session switch), the drained items are re-queued at the head of the
- *  pending buffers so the next attempt can retry them — preventing silent
- *  loss of completion notices.
+/**
+ * Send a terminal job's <task-notification>, exactly once. The latch is set
+ * BEFORE the send, so a concurrent consumer can never produce a duplicate;
+ * if the send itself throws, the notification is lost rather than retried
+ * (exactly-once), and the terminal+notified job lingers until the lazy sweep
+ * in `jobs list`.
  *
- *  Re-checks `outputConsumed` AFTER draining. A job can be enqueued while the
- *  agent is mid-turn (outputConsumed still unset) and then have its outcome
- *  learned via `jobs output` / `job_decide` later in the SAME turn, flipping
- *  the flag while the job is parked in the buffer. Without this flush-time
- *  filter, the turn-end notice would re-tell the agent about a job it just
- *  handled — the exact redundancy this module exists to prevent. Already-
- *  consumed jobs are dropped, never re-queued. */
-function sendCoalescedNotice(
-    reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext,
-    deliver: typeof DELIVER_STEER | typeof DELIVER_FOLLOWUP
-): void {
-    clearFlushTimer(reg);
-    const monitors = reg.pendingMonitorEnds;
-    // Flush-time suppression: drop jobs the agent already learned the outcome
-    // of while they were parked here (Claude Code's `notified`-flag parity).
-    const jobs = reg.pendingFinished.filter((j) => !j.outputConsumed);
-    if (jobs.length === 0 && monitors.length === 0) {
-        reg.pendingFinished = [];
-        reg.pendingMonitorEnds = [];
-        return;
-    }
-    reg.pendingFinished = [];
-    reg.pendingMonitorEnds = [];
-
-    const { content, level } = formatNotices(jobs, monitors);
-
-    try {
-        ctx.ui.notify(content, level);
-    } catch (err) {
-        // Banner failed (typically a stale ctx after a session switch/fork).
-        // Re-queue at the head so the next flush attempt can retry, and bail
-        // — if the UI is stale, sendMessage is almost certainly stale too.
-        requeueHead(reg, jobs, monitors);
-        log.error("[bg-tasks] notice dropped, re-queued:", err);
-        return;
-    }
+ * On success the job is evicted from the live registry (terminal + notified)
+ * unless `evict: false` — the monitor path sends before the job is marked
+ * terminal and lets completeJob evict instead.
+ *
+ * Returns true when the notification was sent.
+ */
+export function sendTaskNotification(args: {
+    reg: BackgroundRegistry;
+    pi: ExtensionAPI;
+    job: Job;
+    /** Explicit terminal status when the job isn't marked terminal yet. */
+    status?: TerminalStatus;
+    /** Explicit summary (monitors compose their own). */
+    summary?: string;
+    evict?: boolean;
+}): boolean {
+    const { reg, pi, job } = args;
+    if (job.notified) return false;
+    job.notified = true;
+    const status = args.status ?? (job.status as TerminalStatus);
+    const summary = args.summary ?? completionSummary(job, status);
 
     try {
         pi.sendMessage(
             {
-                customType: EVENT.jobFinished,
-                content,
+                customType: EVENT.taskNotification,
+                content: buildTaskNotification({
+                    taskId: job.id,
+                    toolUseId: job.toolCallId || undefined,
+                    outputFile: job.logPath,
+                    status,
+                    summary,
+                }),
                 display: true,
                 details: {
-                    jobCount: jobs.length,
-                    monitorCount: monitors.length,
-                    jobs: jobs.map((j) => ({
-                        jobId: j.id,
-                        status: j.status,
-                        exitCode: j.exitCode,
-                        command: j.command,
-                        logPath: j.logPath,
-                    })),
-                    monitors: monitors.map((m) => ({ description: m.description, summary: m.summary })),
+                    jobId: job.id,
+                    status,
+                    summary,
+                    outputFile: job.logPath,
                 },
             },
-            deliver
+            DELIVER_STEER
         );
     } catch (err) {
-        // Banner went out but the agent didn't get the message. Re-queue at
-        // the head so a retry surfaces the notice to the agent on the next
-        // pass.
-        requeueHead(reg, jobs, monitors);
-        log.error("[bg-tasks] sendMessage failed, notice re-queued:", err);
-        return;
+        console.error("[bg-tasks] task notification failed:", err);
+        return false;
     }
-}
-
-/** Prepend drained jobs + monitors back onto the pending buffers so the next
- *  flush attempt retries them. Centralized so a future code path can't
- *  accidentally forget one of the two buffers. */
-function requeueHead(
-    reg: BackgroundRegistry,
-    jobs: readonly Job[],
-    monitors: readonly MonitorEnd[]
-): void {
-    if (jobs.length) reg.pendingFinished = [...jobs, ...reg.pendingFinished];
-    if (monitors.length) reg.pendingMonitorEnds = [...monitors, ...reg.pendingMonitorEnds];
-}
-
-/** Logger hook for the re-queue paths. Tests swap `log` for a no-op so the
- *  throw-path tests don't pollute test output; production keeps it as
- *  `console.error`. Mutable so `setLogger` can swap at runtime. */
-interface Logger {
-    error(...args: unknown[]): void;
-}
-let log: Logger = {
-    error: (...args: unknown[]): void => console.error(...args),
-};
-/** Swap the logger (used by tests). Pass `null` to restore the default. */
-export function setLogger(next: Logger | null): void {
-    log = next ?? { error: (...args: unknown[]): void => console.error(...args) };
-}
-
-/** Cancel any pending notices without flushing (session shutdown). */
-export function cancelPendingNotices(reg: BackgroundRegistry): void {
-    clearFlushTimer(reg);
-    reg.pendingFinished = [];
-    reg.pendingMonitorEnds = [];
-}
-
-function clearFlushTimer(reg: BackgroundRegistry): void {
-    if (reg.noticeFlushTimer) {
-        clearTimeout(reg.noticeFlushTimer);
-        reg.noticeFlushTimer = undefined;
-    }
+    if (args.evict !== false) forget(reg, job);
+    return true;
 }

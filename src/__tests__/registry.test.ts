@@ -13,7 +13,7 @@ import {
     findJob,
     forget,
     getStats,
-    nextJobId,
+    newJobId,
 } from "../registry.ts";
 import type { Job } from "../types.ts";
 
@@ -33,12 +33,14 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     };
 }
 
-void describe("nextJobId", () => {
-    void it("counter 증가하며 포맷", () => {
-        const reg = new BackgroundRegistry();
-        assert.equal(nextJobId(reg), `job-${process.pid}-1`);
-        assert.equal(nextJobId(reg), `job-${process.pid}-2`);
-        assert.equal(reg.counter, 2);
+void describe("newJobId", () => {
+    void it("kind prefix + 8 random base36 chars (CC's typed task ids)", () => {
+        assert.match(newJobId("shell"), /^b[0-9a-z]{8}$/);
+        assert.match(newJobId("monitor"), /^m[0-9a-z]{8}$/);
+        assert.match(newJobId("agent"), /^a[0-9a-z]{8}$/);
+    });
+    void it("random — consecutive ids differ", () => {
+        assert.notEqual(newJobId("shell"), newJobId("shell"));
     });
 });
 
@@ -49,17 +51,15 @@ void describe("findJob", () => {
         reg.jobs.set("job-1", job);
         assert.equal(findJob(reg, "job-1"), job);
     });
-    void it("'job-' 접두사 폴백", () => {
-        const reg = new BackgroundRegistry();
-        const job = makeJob({ id: "job-42" });
-        reg.jobs.set("job-42", job);
-        assert.equal(findJob(reg, "42"), job);
-    });
     void it("recentTerminal에서 찾기", () => {
         const reg = new BackgroundRegistry();
         const job = makeJob({ id: "job-old", status: "completed" });
         reg.recentTerminal.push(job);
         assert.equal(findJob(reg, "job-old"), job);
+    });
+    void it("unknown id returns undefined", () => {
+        const reg = new BackgroundRegistry();
+        assert.equal(findJob(reg, "nope"), undefined);
     });
 });
 
@@ -88,13 +88,15 @@ void describe("add / forget 카운터", () => {
         forget(reg, job);
         assert.equal(reg.failedCount, 1);
     });
-    void it("forget + killed는 카운터 증가 안 함", () => {
+    void it("forget + killed increments the lifetime killed counter", () => {
         const reg = new BackgroundRegistry();
         const job = makeJob({ id: "job-3", status: "killed" });
         add(reg, job);
         forget(reg, job);
+        assert.equal(reg.killedCount, 1);
         assert.equal(reg.completedCount, 0);
         assert.equal(reg.failedCount, 0);
+        assert.equal(getStats(reg).killed, 1);
     });
     void it("recentTerminal 링은 20개에서 멈춤", () => {
         const reg = new BackgroundRegistry();
@@ -104,25 +106,6 @@ void describe("add / forget 카운터", () => {
             forget(reg, job);
         }
         assert.equal(reg.recentTerminal.length, 20);
-    });
-});
-
-void describe("pendingDecisionJobId 정리", () => {
-    void it("forget이 동일 ID면 클리어", () => {
-        const reg = new BackgroundRegistry();
-        const job = makeJob({ id: "job-pending" });
-        add(reg, job);
-        reg.pendingDecisionJobId = "job-pending";
-        forget(reg, job);
-        assert.equal(reg.pendingDecisionJobId, undefined);
-    });
-    void it("다른 ID면 그대로", () => {
-        const reg = new BackgroundRegistry();
-        const job = makeJob({ id: "job-other" });
-        add(reg, job);
-        reg.pendingDecisionJobId = "job-someother";
-        forget(reg, job);
-        assert.equal(reg.pendingDecisionJobId, "job-someother");
     });
 });
 

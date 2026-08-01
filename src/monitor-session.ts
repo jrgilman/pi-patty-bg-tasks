@@ -20,10 +20,10 @@ import {
     type UiContext,
 } from "./types.ts";
 import { renderSidebar } from "./registry.ts";
-import { isSignalExit, startBackgroundJob, terminateJobSilently } from "./lifecycle.ts";
+import { startBackgroundJob, terminateJobSilently } from "./lifecycle.ts";
 import { followLines, type MonitorFollower } from "./monitor-follow.ts";
 import type { MonitorSource } from "./monitor-source.ts";
-import { enqueueMonitorEnd } from "./notify.ts";
+import { completionSummary, sendTaskNotification, type TerminalStatus } from "./notify.ts";
 
 /**
  * Wire a monitor's source to its event stream, terminal event, deadline, and
@@ -51,9 +51,8 @@ export function startMonitorSession(args: {
     // Stream events stay live but passive (delivered as a follow-up, no wake) —
     // they carry data the agent is actively watching and surface on the agent's
     // next natural turn without spawning an unsolicited one. The terminal
-    // notice (stream ended / stopped / failed) goes through the coalescer
-    // instead (see finishMonitor), so a batch of monitors ending doesn't add
-    // to the wall of notices.
+    // notice (stream ended / stopped / failed) is its own <task-notification>
+    // (see finishMonitor), sent the moment the source ends.
     const emitEvent = (lines: string[]): void => {
         if (lines.length === 0) return;
         pi.sendMessage(
@@ -83,7 +82,8 @@ export function startMonitorSession(args: {
         // Don't trip the firehose guard while draining the final flush.
         if (!finishing && windowLines > MONITOR_MAX_LINES_PER_WINDOW) {
             stopMonitor(
-                `stopped: too many events (>${MONITOR_MAX_LINES_PER_WINDOW}/${MONITOR_RATE_WINDOW_MS / 1000}s) — restart with a tighter filter`
+                "killed",
+                `Monitor "${description}" stopped (too many events (>${MONITOR_MAX_LINES_PER_WINDOW}/${MONITOR_RATE_WINDOW_MS / 1000}s) — restart with a tighter filter)`
             );
         }
     });
@@ -94,30 +94,31 @@ export function startMonitorSession(args: {
     // onExit), so a user-initiated kill stays lossless.
     job.stop = source.stop;
 
-    const finishMonitor = (summary: string): void => {
+    /**
+     * Emit exactly one terminal <task-notification> for the monitor. Sent
+     * before the job is marked terminal (onExit runs ahead of completeJob), so
+     * the status/summary are explicit and eviction is left to completeJob.
+     */
+    const finishMonitor = (status: TerminalStatus, summary: string): void => {
         if (terminalEmitted) return;
         // Flush remaining lines first (while terminalEmitted is still false so
-        // the follower callback emits them), then the coalesced terminal notice.
+        // the follower callback emits them), then the terminal notification.
         finishing = true;
         follower.stop(true);
         terminalEmitted = true;
-        enqueueMonitorEnd(reg, pi, ctx, {
-            description,
-            summary,
-            failed: summary.startsWith("script failed"),
-        });
+        sendTaskNotification({ reg, pi, job, status, summary, evict: false });
     };
 
     /** Forced stop (timeout / firehose). Emits a terminal event, then routes
      *  through the standard silent-kill path (which calls job.stop). */
-    function stopMonitor(summary: string): void {
-        finishMonitor(summary);
+    function stopMonitor(status: TerminalStatus, summary: string): void {
+        finishMonitor(status, summary);
         terminateJobSilently(reg, job);
         renderSidebar(reg, ctx);
     }
 
     // Wire exit → terminal event. shouldNotify:false because the monitor owns
-    // its own terminal event (no jobFinished double-fire). Monitors stream their
+    // its own terminal event (no double-fire from completeJob). Monitors stream their
     // own output, so the prompt-stall heuristic is nonsensical here; the oversize
     // cap is also suppressed for persistent watches (session-length log tails are
     // expected to grow).
@@ -130,16 +131,20 @@ export function startMonitorSession(args: {
         shouldNotify: false,
         disablePromptStall: true,
         disableOversizeKill: persistent,
-        onExit: (code) => {
-            let summary: string;
-            if (job.status === "killed" || isSignalExit(code)) {
-                summary = "stopped";
-            } else if (code === 0 || code === null) {
-                summary = "stream ended";
+        onExit: ({ code, signal }) => {
+            // A signal death (external kill) is the "stopped" summary, never
+            // "stream ended". Natural exits reuse completionSummary — the job
+            // carries name: description, so the summary names the watch.
+            if (job.status === "killed" || signal !== null) {
+                finishMonitor("killed", completionSummary(job, "killed"));
+            } else if (code === 0) {
+                finishMonitor("completed", completionSummary(job, "completed"));
             } else {
-                summary = `script failed (exit ${code})`;
+                // completeJob marks terminal after onExit — set the exit code
+                // now so completionSummary can name it.
+                job.exitCode = code ?? undefined;
+                finishMonitor("failed", completionSummary(job, "failed"));
             }
-            finishMonitor(summary);
         },
     });
 
@@ -148,7 +153,10 @@ export function startMonitorSession(args: {
     // closure alive for the whole timeout window.
     if (!persistent) {
         const deadline = setTimeout(() => {
-            stopMonitor(`stopped (timeout after ${Math.round(timeoutMs / 1000)}s)`);
+            stopMonitor(
+                "killed",
+                `Monitor "${description}" stopped (timeout after ${Math.round(timeoutMs / 1000)}s)`
+            );
         }, timeoutMs);
         (deadline as NodeJS.Timeout).unref();
         jobAc.signal.addEventListener("abort", () => clearTimeout(deadline), { once: true });

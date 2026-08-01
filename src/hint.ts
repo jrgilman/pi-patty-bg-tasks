@@ -1,6 +1,6 @@
 /**
- * Live "(ctrl+b to run in background)" hint shown below the editor while a
- * foreground bash command is running — mirrors Claude Code's BackgroundHint,
+ * Live "(ctrl+shift+b to run in background)" hint shown below the editor while
+ * a foreground bash command is running — mirrors Claude Code's BackgroundHint,
  * which appears once a command has run past the quick-completion window.
  */
 
@@ -17,22 +17,11 @@ const HINT_KEY = "bg-hint";
  */
 let activeHints = 0;
 
-/**
- * The key to press to background, as shown in the hint. Inside a tmux session
- * `ctrl+b` is tmux's prefix key, so it must be pressed twice — Claude Code
- * shows the same "(twice)" note.
- */
-function backgroundHintLabel(): string {
-    return process.env.TMUX
-        ? "ctrl+b ctrl+b (twice) to run in background"
-        : "ctrl+b to run in background";
-}
-
 /** Show the background hint below the editor (idempotent across parallel commands). */
 export function showBackgroundHint(ctx: UiContext): void {
     activeHints++;
     if (activeHints === 1) {
-        ctx.ui.setWidget(HINT_KEY, [`(${backgroundHintLabel()})`], {
+        ctx.ui.setWidget(HINT_KEY, ["(ctrl+shift+b to run in background)"], {
             placement: "belowEditor",
         });
     }

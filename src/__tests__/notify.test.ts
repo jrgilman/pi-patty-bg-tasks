@@ -2,23 +2,21 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { BackgroundRegistry } from "../state.ts";
 import {
-    cancelPendingNotices,
-    enqueueFinished,
-    enqueueMonitorEnd,
-    flushIdleNotices,
-    flushTurnBoundaryNotices,
-    noteAgentEnd,
-    noteAgentStart,
-    setLogger,
+    buildTaskNotification,
+    completionSummary,
+    escapeXml,
+    markNotified,
+    sendTaskNotification,
 } from "../notify.ts";
-import { markOutcomeKnown, markTerminal } from "../lifecycle.ts";
-import { type Job, type UiContext } from "../types.ts";
+import { completeJob } from "../lifecycle.ts";
+import { add } from "../registry.ts";
+import { EVENT, type Job, type UiContext } from "../types.ts";
 
 interface Captured {
     customType: string;
     content: string;
-    level?: string;
-    details?: { jobCount?: number; monitorCount?: number };
+    display?: boolean;
+    details?: { jobId?: string; status?: string; summary?: string; outputFile?: string };
 }
 
 interface DeliverOpts {
@@ -26,10 +24,9 @@ interface DeliverOpts {
     triggerTurn: boolean;
 }
 
-function harness(opts?: { deliverThrows?: boolean; notifyThrows?: boolean }) {
+function harness(opts?: { deliverThrows?: boolean }) {
     const messages: Captured[] = [];
     const deliverOptions: DeliverOpts[] = [];
-    const notices: { content: string; level?: string }[] = [];
     const pi = {
         sendMessage: (m: Captured, o?: DeliverOpts) => {
             if (opts?.deliverThrows) throw new Error("sendMessage failed");
@@ -39,20 +36,13 @@ function harness(opts?: { deliverThrows?: boolean; notifyThrows?: boolean }) {
     };
     const ctx = {
         ui: {
-            notify: (content: string, level?: string) => {
-                if (opts?.notifyThrows) throw new Error("notify failed");
-                notices.push({ content, level });
-            },
+            notify() {},
+            setWidget() {},
+            setStatus() {},
+            theme: { fg: (_c: string, t: string) => t },
         },
     } as unknown as UiContext;
-    return {
-        reg: new BackgroundRegistry(),
-        pi,
-        ctx,
-        messages,
-        deliverOptions,
-        notices,
-    };
+    return { reg: new BackgroundRegistry(), pi, ctx, messages, deliverOptions };
 }
 
 function mkJob(over: Partial<Job>): Job {
@@ -62,294 +52,271 @@ function mkJob(over: Partial<Job>): Job {
         pid: 100,
         startTime: Date.now(),
         status: "completed",
+        exitCode: 0,
         logPath: "/tmp/pi-bg/job-1-1.log",
-        toolCallId: "t",
+        toolCallId: "tc-42",
         isBackgrounded: true,
         ...over,
     } as Job;
 }
 
-void describe("notify — turn-boundary coalescing", () => {
-    void it("a single finished job reads like one line", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-5", name: "tests" }));
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 1);
-        const c = messages[0].content;
-        assert.match(c, /^✓ tests \(/m);
-        assert.ok(c.includes("job-1-5"), "job id appears in the status line");
-    });
-
-    void it("collapses a whole turn's finishes (spread out) into ONE summary at agent_end", () => {
-        const { reg, pi, ctx, messages } = harness();
-        noteAgentStart(reg, pi as never, ctx); // agent is mid-turn
-
-        // Jobs finishing at different times during the turn — the old 400ms
-        // window would never merge these; now they all wait for the turn end.
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1", status: "completed" }));
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-2", status: "failed", exitCode: 1 }));
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "API health", summary: "stream ended", failed: false });
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "port 4000", summary: "stopped (timeout)", failed: false });
-
-        assert.equal(messages.length, 0, "nothing flushes while the agent is busy");
-
-        noteAgentEnd(reg, pi as never, ctx);
-
-        assert.equal(messages.length, 1, "one summary at the turn boundary");
-        const c = messages[0].content;
-        assert.match(c, /2 background jobs finished \(1 failed\)/);
-        assert.match(c, /2 monitors ended/);
-        assert.match(c, /^✓ "npm test" \(/m);
-        assert.match(c, /^✗ "npm test" \(.*exit 1/m);
-        // Both job ids appear in their status lines.
-        assert.ok(c.includes("job-1-1"), "completed job id in its status line");
-        assert.ok(c.includes("job-1-2"), "failed job id in its status line");
-        assert.match(c, /◉ API health — stream ended/);
-        assert.match(c, /◉ port 4000 — stopped \(timeout\)/);
-        // Only the failed job carries a nudge; the completed one is bare.
-        const nudges = c.split("\n").filter((l) => l.includes("jobs({ action: \"output\""));
-        assert.equal(nudges.length, 1, "nudge only for the failed job");
-        assert.ok(nudges.some((n) => n.includes('"job-1-2"')));
-    });
-
-    void it("does not flush mid-turn even past the idle window", async () => {
-        const { reg, pi, ctx, messages } = harness();
-        noteAgentStart(reg, pi as never, ctx);
-        enqueueFinished(reg, pi as never, ctx, mkJob({}));
-        await new Promise((r) => setTimeout(r, 600));
-        assert.equal(messages.length, 0, "held until the turn ends, no idle-timer flush");
-        noteAgentEnd(reg, pi as never, ctx);
-        assert.equal(messages.length, 1);
-    });
-
-    void it("while idle, a finish flushes via the fallback timer (coalesced)", async () => {
-        const { reg, pi, ctx, messages } = harness();
-        // agent idle (agentBusy=false by default)
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1" }));
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-2" }));
-        assert.equal(messages.length, 0, "not flushed immediately");
-        await new Promise((r) => setTimeout(r, 600));
-        assert.equal(messages.length, 1, "one coalesced flush after the idle window");
-        const c = messages[0].content;
-        assert.match(c, /2 background jobs finished/);
-        // Completed jobs carry no nudge (Claude Code parity) — they're reported
-        // as bare status lines. The agent only needs to act on failures.
-        const nudges = c.split("\n").filter((l) => l.includes("jobs({ action: \"output\""));
-        assert.equal(nudges.length, 0);
-    });
-
-    void it("noteAgentStart drains stranded notices (guard), then holds new ones for the turn", async () => {
-        const { reg, pi, ctx, messages } = harness();
-        // Simulate notices left pending by a prior turn that threw before agent_end.
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-stranded" }));
-        noteAgentStart(reg, pi as never, ctx); // drains the stranded notice up front
-        assert.equal(messages.length, 1, "stranded notice flushed at turn start");
-
-        // New finishes during this turn are held until it ends.
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-new" }));
-        await new Promise((r) => setTimeout(r, 600));
-        assert.equal(messages.length, 1, "new notice held for the turn");
-        noteAgentEnd(reg, pi as never, ctx);
-        assert.equal(messages.length, 2);
-    });
-
-    void it("only failed jobs carry an output-read nudge (completed are bare)", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1", status: "completed" }));
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-2", status: "failed", exitCode: 2 }));
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        const c = messages[0].content;
-        const nudges = c.split("\n").filter((l) => l.includes("jobs({ action: \"output\""));
-        assert.equal(nudges.length, 1, "nudge only for the failed job");
-        assert.ok(!nudges.some((n) => n.includes('"job-1-1"')));
-        assert.ok(nudges.some((n) => n.includes('"job-1-2"')));
-    });
-
-    void it("a lone monitor end reads like one line", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "deploy", summary: "stream ended", failed: false });
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 1);
-        assert.match(messages[0].content, /◉ deploy — stream ended/);
-    });
-
-    void it("a killed job is reported without a nudge (intentional cleanup)", () => {
-        const { reg, pi, ctx, messages, notices } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1", status: "killed" }));
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        const c = messages[0].content;
-        assert.match(c, /^⊘ /m, "uses the kill glyph, not the failure glyph");
-        assert.match(c, /, killed/);
-        assert.equal(
-            c.split("\n").filter((l) => l.includes("jobs({ action: \"output\"")).length,
-            0,
-            "no nudge for a killed job"
-        );
-        assert.equal(notices[0].level, "info", "killed is not an error");
-    });
-
-    void it("a failed job without an exitCode is labeled clearly", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1", status: "failed" }));
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.match(messages[0].content, /^✗ /m);
-        assert.match(messages[0].content, /, failed\b/);
-    });
-
-    void it("an unnamed job shows a command preview, not just the id", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(
-            reg,
-            pi as never,
-            ctx,
-            mkJob({ id: "job-7-9", command: "npm run e2e --reporter=spec" })
-        );
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.match(messages[0].content, /npm run e2e/);
-    });
-
-    void it("1 job + 1 monitor is reported together (no silent drop)", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1" }));
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "deploy", summary: "stream ended", failed: false });
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        const c = messages[0].content;
-        assert.match(c, /1 background job finished/);
-        assert.match(c, /1 monitor ended/);
-        assert.match(c, /✓ "npm test" \(/);
-        assert.match(c, /◉ deploy — stream ended/);
-    });
-
-    void it("monitor failures show up in the headline count", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "a", summary: "ok", failed: false });
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "b", summary: "died", failed: true });
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "c", summary: "ok", failed: false });
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.match(messages[0].content, /3 monitors ended \(1 failed\)/);
-    });
-
-    void it("does not enqueue a job whose output was already consumed", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({ outputConsumed: true }));
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 0);
-        assert.equal(reg.pendingFinished.length, 0);
-    });
-
-    void it("markOutcomeKnown suppresses a later completion notice (CC `notified` parity)", () => {
-        // Mirrors Claude Code's markTaskNotified: once the agent learns a job's
-        // outcome through ANY path (jobs output / job_decide / attach), the
-        // pending completion notice is suppressed so the agent isn't re-told
-        // about something it already handled.
-        const { reg, pi, ctx, messages } = harness();
-        const job = mkJob({ id: "job-1-1", status: "running" });
-        // Agent resolves the job via job_decide / jobs output BEFORE it would
-        // finish — markOutcomeKnown records that the outcome is known.
-        markOutcomeKnown(job);
-        // No-op while running: the flag only sticks once the job is terminal.
-        assert.equal(job.outputConsumed, undefined);
-        // Now the job finishes and is enqueued for a notice…
-        markTerminal(job, "completed");
-        markOutcomeKnown(job);
-        enqueueFinished(reg, pi as never, ctx, job);
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 0, "outcome already known — no notice");
-    });
-
-    void it("markOutcomeKnown AFTER enqueue still suppresses at flush (mid-turn race)", () => {
-        // The race the enqueue-time gate alone can't catch: a job completes
-        // mid-turn and is parked in pendingFinished, THEN the agent reads its
-        // output (jobs output / job_decide check) in the same turn — flipping
-        // outputConsumed while the job is already buffered. The turn-end flush
-        // must drop it, not emit it.
-        const { reg, pi, ctx, messages } = harness();
-        const job = mkJob({ id: "job-1-1", status: "completed" });
-        noteAgentStart(reg, pi as never, ctx); // hold for the turn
-        enqueueFinished(reg, pi as never, ctx, job);
-        assert.equal(reg.pendingFinished.length, 1, "parked mid-turn");
-        // Agent learns the outcome later in the same turn.
-        markOutcomeKnown(job);
-        noteAgentEnd(reg, pi as never, ctx); // turn-end flush
-        assert.equal(messages.length, 0, "already-known job dropped at flush");
-        assert.equal(reg.pendingFinished.length, 0, "not re-queued");
-    });
-
-    void it("flush is a no-op when nothing is pending", () => {
-        const { reg, pi, ctx, messages } = harness();
-        flushTurnBoundaryNotices(reg, pi as never, ctx);
-        noteAgentEnd(reg, pi as never, ctx);
-        assert.equal(messages.length, 0);
-    });
-
-    void it("cancelPendingNotices drops everything without emitting", () => {
-        const { reg, pi, ctx, messages } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({}));
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "x", summary: "stopped", failed: false });
-        cancelPendingNotices(reg);
-        assert.equal(reg.pendingFinished.length, 0);
-        assert.equal(reg.pendingMonitorEnds.length, 0);
-        assert.equal(reg.noticeFlushTimer, undefined);
-        assert.equal(messages.length, 0);
+void describe("escapeXml", () => {
+    void it("escapes &, < and > only", () => {
+        assert.equal(escapeXml(`a & b <c> "q" 'apost'`), `a &amp; b &lt;c&gt; "q" 'apost'`);
     });
 });
 
-void describe("notify — wake shape per path", () => {
-    // Suppress the re-queue-path log lines during the throw-path tests so test
-    // output stays clean. Restore in afterEach.
-    setLogger({ error: () => {} });
-    void it("idle-path flush steers AND triggers a turn (so the agent reacts)", () => {
-        const { reg, pi, ctx, messages, deliverOptions } = harness();
-        enqueueFinished(reg, pi as never, ctx, mkJob({}));
-        flushIdleNotices(reg, pi as never, ctx);
+void describe("buildTaskNotification — CC's exact XML", () => {
+    void it("includes tool_use_id and status when present", () => {
+        const xml = buildTaskNotification({
+            taskId: "job-1-1",
+            toolUseId: "tc-42",
+            outputFile: "/tmp/pi-bg/job-1-1.log",
+            status: "completed",
+            summary: `Background command "npm test" completed (exit code 0)`,
+        });
+        assert.equal(
+            xml,
+            [
+                "<task-notification>",
+                "<task_id>job-1-1</task_id>",
+                "<tool_use_id>tc-42</tool_use_id>",
+                "<output_file>/tmp/pi-bg/job-1-1.log</output_file>",
+                "<status>completed</status>",
+                `<summary>Background command "npm test" completed (exit code 0)</summary>`,
+                "</task-notification>",
+            ].join("\n")
+        );
+    });
+
+    void it("omits the tool_use_id line when there is none", () => {
+        const xml = buildTaskNotification({
+            taskId: "job-1-1",
+            outputFile: "/tmp/x.log",
+            status: "failed",
+            summary: "x",
+        });
+        assert.ok(!xml.includes("tool_use_id"));
+    });
+
+    void it("omits the status line when there is none (stall warning)", () => {
+        const xml = buildTaskNotification({
+            taskId: "job-1-1",
+            outputFile: "/tmp/x.log",
+            summary: "waiting",
+        });
+        assert.ok(!xml.includes("<status>"));
+    });
+
+    void it("escapes the summary", () => {
+        const xml = buildTaskNotification({
+            taskId: "t",
+            outputFile: "f",
+            summary: `a & <b>`,
+        });
+        assert.ok(xml.includes("<summary>a &amp; &lt;b&gt;</summary>"));
+    });
+});
+
+void describe("completionSummary — CC's exact strings", () => {
+    void it("bash completed with an exit code", () => {
+        assert.equal(
+            completionSummary(mkJob({ status: "completed", exitCode: 0 })),
+            `Background command "npm test" completed (exit code 0)`
+        );
+    });
+    void it("bash completed without an exit code omits the suffix", () => {
+        assert.equal(
+            completionSummary(mkJob({ status: "completed", exitCode: undefined })),
+            `Background command "npm test" completed`
+        );
+    });
+    void it("bash failed", () => {
+        assert.equal(
+            completionSummary(mkJob({ status: "failed", exitCode: 3 })),
+            `Background command "npm test" failed with exit code 3`
+        );
+    });
+    void it("bash killed", () => {
+        assert.equal(
+            completionSummary(mkJob({ status: "killed" })),
+            `Background command "npm test" was stopped`
+        );
+    });
+    void it("uses the job name as {desc} when set", () => {
+        assert.equal(
+            completionSummary(mkJob({ name: "tests", status: "completed", exitCode: 0 })),
+            `Background command "tests" completed (exit code 0)`
+        );
+    });
+    void it("monitor summaries", () => {
+        const base = { kind: "monitor" as const, name: "API health" };
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "completed" })),
+            `Monitor "API health" stream ended`
+        );
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "failed", exitCode: 2 })),
+            `Monitor "API health" script failed (exit 2)`
+        );
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "killed" })),
+            `Monitor "API health" stopped`
+        );
+    });
+    void it("agent summaries", () => {
+        const base = { kind: "agent" as const, command: "pi -p (background agent)" };
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "completed" })),
+            `Agent "pi -p (background agent)" completed`
+        );
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "failed", exitCode: 1 })),
+            `Agent "pi -p (background agent)" failed: exit code 1`
+        );
+        assert.equal(
+            completionSummary(mkJob({ ...base, status: "killed" })),
+            `Agent "pi -p (background agent)" was stopped`
+        );
+    });
+});
+
+void describe("sendTaskNotification — exactly-once + eviction", () => {
+    void it("sends the XML with steer delivery and evicts the job", () => {
+        const { reg, pi, messages, deliverOptions } = harness();
+        const job = mkJob({ id: "job-1-5", status: "completed", exitCode: 0 });
+        add(reg, job);
+
+        const sent = sendTaskNotification({ reg, pi: pi as never, job });
+
+        assert.equal(sent, true);
         assert.equal(messages.length, 1);
-        assert.equal(deliverOptions.length, 1);
-        assert.equal(deliverOptions[0].deliverAs, "steer");
-        assert.equal(deliverOptions[0].triggerTurn, true);
+        const m = messages[0];
+        assert.equal(m.customType, EVENT.taskNotification);
+        assert.equal(m.display, true);
+        assert.equal(
+            m.content,
+            [
+                "<task-notification>",
+                "<task_id>job-1-5</task_id>",
+                "<tool_use_id>tc-42</tool_use_id>",
+                "<output_file>/tmp/pi-bg/job-1-1.log</output_file>",
+                "<status>completed</status>",
+                `<summary>Background command "npm test" completed (exit code 0)</summary>`,
+                "</task-notification>",
+            ].join("\n")
+        );
+        // Details carry the structured status/summary for the TUI renderer.
+        assert.equal(m.details?.status, "completed");
+        assert.equal(m.details?.summary, `Background command "npm test" completed (exit code 0)`);
+        // Steer + triggerTurn — CC's 'next' priority, waking an idle agent.
+        assert.deepEqual(deliverOptions[0], { deliverAs: "steer", triggerTurn: true });
+        // Evicted: terminal + notified leaves the live registry.
+        assert.equal(reg.jobs.has("job-1-5"), false);
+        assert.equal(reg.recentTerminal.length, 1);
+        assert.equal(reg.completedCount, 1);
     });
 
-    void it("turn-boundary flush is passive (no unsolicited follow-up turn)", () => {
-        const { reg, pi, ctx, messages, deliverOptions } = harness();
-        // Simulate the agent being mid-turn so enqueueFinished does NOT arm
-        // the idle timer — we want a pure turn-boundary flush.
-        reg.agentBusy = true;
-        enqueueFinished(reg, pi as never, ctx, mkJob({}));
-        noteAgentEnd(reg, pi as never, ctx); // agent_end → turn-boundary flush
+    void it("latches exactly-once: a second send is a no-op", () => {
+        const { reg, pi, messages } = harness();
+        const job = mkJob({});
+        add(reg, job);
+        sendTaskNotification({ reg, pi: pi as never, job });
+        assert.equal(job.notified, true);
+        const again = sendTaskNotification({ reg, pi: pi as never, job });
+        assert.equal(again, false);
         assert.equal(messages.length, 1);
-        assert.equal(deliverOptions.length, 1);
-        assert.equal(deliverOptions[0].deliverAs, "followUp");
-        assert.equal(deliverOptions[0].triggerTurn, false,
-            "turn-boundary notice must not spawn an unsolicited turn");
     });
 
-    void it("noteAgentStart drain path is passive (stranded notices don't wake)", () => {
-        const { reg, pi, ctx, messages, deliverOptions } = harness();
-        // Stranded from a prior turn that threw before its agent_end.
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-stranded" }));
-        noteAgentStart(reg, pi as never, ctx);
+    void it("kill suppression: a pre-latched job is skipped (and not evicted)", () => {
+        const { reg, pi, messages } = harness();
+        const job = mkJob({ status: "killed" });
+        add(reg, job);
+        markNotified(job); // kill path latches BEFORE the exit handler runs
+        const sent = sendTaskNotification({ reg, pi: pi as never, job });
+        assert.equal(sent, false);
+        assert.equal(messages.length, 0);
+        assert.equal(reg.jobs.has("job-1-1"), true, "lingers for the lazy sweep");
+    });
+
+    void it("evict: false keeps the job in the registry (monitor path)", () => {
+        const { reg, pi, messages } = harness();
+        const job = mkJob({ status: "running" as Job["status"] });
+        add(reg, job);
+        const sent = sendTaskNotification({
+            reg,
+            pi: pi as never,
+            job,
+            status: "completed",
+            summary: `Monitor "watch" stream ended`,
+            evict: false,
+        });
+        assert.equal(sent, true);
+        assert.equal(reg.jobs.has("job-1-1"), true);
+        assert.ok(messages[0].content.includes("<status>completed</status>"));
+    });
+
+    void it("a failed send does not retry and does not evict (exactly-once)", () => {
+        const { reg, pi, messages } = harness({ deliverThrows: true });
+        const job = mkJob({});
+        add(reg, job);
+        // Silence the module's console.error for the throw path.
+        const origError = console.error;
+        console.error = () => {};
+        let sent = false;
+        try {
+            sent = sendTaskNotification({ reg, pi: pi as never, job });
+        } finally {
+            console.error = origError;
+        }
+        assert.equal(sent, false);
+        assert.equal(messages.length, 0);
+        assert.equal(job.notified, true, "latch already set — never retried");
+        assert.equal(reg.jobs.has("job-1-1"), true);
+    });
+});
+
+void describe("completeJob — exit-path notification", () => {
+    void it("sends the <task-notification> the moment the job exits", () => {
+        const { reg, pi, ctx, messages } = harness();
+        const job = mkJob({ id: "job-9-1", status: "running", exitCode: undefined });
+        add(reg, job);
+        completeJob({ job, code: 0, reg, pi: pi as never, ctx });
         assert.equal(messages.length, 1);
-        assert.equal(deliverOptions[0].deliverAs, "followUp",
-            "drain must not spawn an unsolicited turn");
+        assert.ok(messages[0].content.includes("<status>completed</status>"));
+        assert.equal(reg.jobs.has("job-9-1"), false, "evicted after the send");
     });
 
-    void it("idle-path flush re-queues items when sendMessage throws (no silent loss)", () => {
-        const { reg, pi, ctx, messages } = harness({ deliverThrows: true });
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1" }));
-        enqueueMonitorEnd(reg, pi as never, ctx, { description: "deploy", summary: "stream ended", failed: false });
-        flushIdleNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 0, "sendMessage threw — no message recorded");
-        // Re-queued at the head so a retry surfaces them.
-        assert.equal(reg.pendingFinished.length, 1);
-        assert.equal(reg.pendingMonitorEnds.length, 1);
-        assert.equal(reg.pendingFinished[0].id, "job-1-1");
+    void it("a job read before exit (notified) exits silently and lingers", () => {
+        const { reg, pi, ctx, messages } = harness();
+        const job = mkJob({ id: "job-9-2", status: "running", exitCode: undefined });
+        add(reg, job);
+        markNotified(job); // jobs output / attach raced the exit
+        completeJob({ job, code: 1, reg, pi: pi as never, ctx });
+        assert.equal(messages.length, 0);
+        assert.equal(job.status, "failed");
+        assert.equal(reg.jobs.has("job-9-2"), true);
     });
 
-    void it("idle-path flush re-queues items when notify throws (no silent loss)", () => {
-        const { reg, pi, ctx, messages } = harness({ notifyThrows: true });
-        enqueueFinished(reg, pi as never, ctx, mkJob({ id: "job-1-1" }));
-        flushIdleNotices(reg, pi as never, ctx);
-        assert.equal(messages.length, 0, "sendMessage never reached");
-        assert.equal(reg.pendingFinished.length, 1, "re-queued for retry");
-        assert.equal(reg.pendingFinished[0].id, "job-1-1");
+    void it("shouldNotify: false + notified evicts without sending (monitor path)", () => {
+        const { reg, pi, ctx, messages } = harness();
+        const job = mkJob({ id: "job-9-3", status: "running", exitCode: undefined });
+        add(reg, job);
+        markNotified(job); // monitor already sent its own terminal notification
+        completeJob({ job, code: 0, reg, pi: pi as never, ctx, shouldNotify: false });
+        assert.equal(messages.length, 0);
+        assert.equal(reg.jobs.has("job-9-3"), false);
+    });
+
+    void it("shouldNotify: false without prior notice still evicts (bash_bg notify: false)", () => {
+        const { reg, pi, ctx, messages } = harness();
+        const job = mkJob({ id: "job-9-4", status: "running", exitCode: undefined });
+        add(reg, job);
+        // "Don't notify" IS notified — the job must not linger as a permanent
+        // registry entry.
+        completeJob({ job, code: 0, reg, pi: pi as never, ctx, shouldNotify: false });
+        assert.equal(messages.length, 0);
+        assert.equal(job.notified, true);
+        assert.equal(reg.jobs.has("job-9-4"), false, "evicted — no permanent registry entry");
     });
 });

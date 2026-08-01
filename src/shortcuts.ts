@@ -1,9 +1,14 @@
 /**
  * Keyboard shortcut registration.
  *
- *   - Ctrl+B (and Ctrl+Shift+B alias): move the foreground bash to background
+ *   - Ctrl+Shift+B: move the foreground bash to background
  *   - Ctrl+Shift+J / Shift+Down: open the background task manager
  *   - Ctrl+Shift+X: kill the most recent running job
+ *
+ * Note: Ctrl+B is reserved by pi for `tui.editor.cursorLeft` (built-in
+ * keybinding), so the background shortcut lives on Ctrl+Shift+B. Registering
+ * Ctrl+B anyway triggers pi's startup "extension shortcut conflict" diagnostic
+ * and breaks cursor-left in the editor.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -22,18 +27,11 @@ export function registerShortcuts(
     pi: ExtensionAPI,
     reg: BackgroundRegistry
 ): void {
-    // Primary background shortcut — Ctrl+B, matching Claude Code. Inside a tmux
-    // session Ctrl+B is tmux's prefix key and must be pressed twice; the live
-    // hint shown while a command runs says so.
-    pi.registerShortcut("ctrl+b", {
-        description: "Background the current foreground process",
-        handler: async (ctx) => handleCtrlB(reg, pi, ctx),
-    });
-
-    // Alias for muscle memory / terminals that remap Ctrl+B.
+    // Background shortcut — Ctrl+Shift+B. Ctrl+B itself is pi's built-in
+    // cursor-left binding and must not be claimed (see header note).
     pi.registerShortcut("ctrl+shift+b", {
-        description: "Background the current foreground process (alias for Ctrl+B)",
-        handler: async (ctx) => handleCtrlB(reg, pi, ctx),
+        description: "Background the current foreground process",
+        handler: async (ctx) => handleCtrlB(reg, ctx),
     });
 
     pi.registerShortcut("ctrl+shift+j", {
@@ -53,16 +51,17 @@ export function registerShortcuts(
 }
 
 /**
- * Ctrl+B / Ctrl+Shift+B handler — hand control back to the agent (Claude Code
- * parity): background the running work and, if a message is queued, interrupt
- * the turn so it reaches the agent right away. See lifecycle.takeControl.
+ * Ctrl+Shift+B / `/bg` handler — background ALL running foreground commands
+ * (Claude Code's `backgroundAll`). takeControl deliberately never aborts the
+ * turn: the bash tool returns its "backgrounded" result, the turn ends, and a
+ * queued user message drains at the natural turn boundary. See
+ * lifecycle.takeControl.
  */
 async function handleCtrlB(
     reg: BackgroundRegistry,
-    pi: ExtensionAPI,
     ctx: Parameters<NonNullable<Parameters<ExtensionAPI["registerShortcut"]>[1]["handler"]>>[0]
 ): Promise<void> {
-    takeControl(reg, pi, ctx as ControlContext);
+    takeControl(reg, ctx as ControlContext);
 }
 
 /** Ctrl+Shift+X: kill the most recent running job. */

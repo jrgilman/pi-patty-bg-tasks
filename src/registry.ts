@@ -6,9 +6,12 @@
  * pill bar (`renderSidebar`) and aggregates stats (`getStats`).
  */
 
+import { randomInt } from "node:crypto";
 import { statSync, unlinkSync } from "node:fs";
 import { formatDuration, jobLabel } from "./format.ts";
 import {
+    isTerminalStatus,
+    JOB_ID_PREFIX,
     MAX_CONCURRENT_JOBS,
     PREVIEW_CHARS,
     RECENT_TERMINAL_KEEP,
@@ -21,8 +24,25 @@ import { readBoundedTail, readLastLine } from "./output.ts";
 
 // --- ID generation -------------------------------------------------------
 
-export function nextJobId(reg: BackgroundRegistry): string {
-    return `job-${process.pid}-${++reg.counter}`;
+const ID_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz";
+
+/**
+ * Claude Code's typed task ids: a one-letter kind prefix (b/m/a) plus 8 random
+ * base36 chars from crypto.randomInt (uniform — no modulo bias) — e.g.
+ * `b7f3k9a2x1`. Random (not sequential) so an id is unguessable and
+ * collision-improbable across sessions; when the live registry is passed, a
+ * collision simply regenerates.
+ */
+export function newJobId(kind: JobKind, reg?: BackgroundRegistry): string {
+    let id: string;
+    do {
+        let suffix = "";
+        for (let i = 0; i < 8; i++) {
+            suffix += ID_ALPHABET[randomInt(0, ID_ALPHABET.length)];
+        }
+        id = `${JOB_ID_PREFIX[kind]}${suffix}`;
+    } while (reg?.jobs.has(id));
+    return id;
 }
 
 /** Dedicated log directory. Keeping logs in their own dir (not loose in /tmp)
@@ -98,15 +118,14 @@ export function atConcurrencyLimit(reg: BackgroundRegistry): boolean {
  */
 export function forget(reg: BackgroundRegistry, job: Job): Job | undefined {
     if (!reg.jobs.delete(job.id)) return undefined;
-    if (reg.pendingDecisionJobId === job.id) {
-        reg.pendingDecisionJobId = undefined;
-    }
     if (job.status === "completed") {
         reg.completedCount++;
         reg.totalDurationMs += terminalDurationMs(job);
     } else if (job.status === "failed") {
         reg.failedCount++;
         reg.totalDurationMs += terminalDurationMs(job);
+    } else if (job.status === "killed") {
+        reg.killedCount++;
     }
     reg.recentTerminal.push(job);
     if (reg.recentTerminal.length > RECENT_TERMINAL_KEEP) {
@@ -115,13 +134,12 @@ export function forget(reg: BackgroundRegistry, job: Job): Job | undefined {
     return job;
 }
 
-/** Look up a job by ID. Falls back to prepending "job-" for the common
- *  LLM-stripping case, and to recent-terminal jobs for completed ones. */
+/** Look up a job by ID — first the live registry, then the recent-terminal ring
+ *  for jobs that already finished and were evicted. */
 export function findJob(reg: BackgroundRegistry, jobId: string): Job | undefined {
     return (
         reg.jobs.get(jobId) ??
-        reg.jobs.get(`job-${jobId}`) ??
-        reg.recentTerminal.find((j) => j.id === jobId || j.id === `job-${jobId}`)
+        reg.recentTerminal.find((j) => j.id === jobId)
     );
 }
 
@@ -141,7 +159,7 @@ export function cleanupTerminal(reg: BackgroundRegistry): {
 
     const idsToRemove: string[] = [];
     for (const [id, job] of reg.jobs.entries()) {
-        if (job.status !== "running") {
+        if (isTerminalStatus(job.status)) {
             idsToRemove.push(id);
             bytes += deleteOnce(job.logPath);
             purged++;
@@ -150,7 +168,7 @@ export function cleanupTerminal(reg: BackgroundRegistry): {
     for (const id of idsToRemove) {
         reg.jobs.delete(id);
     }
-    // recent-terminal 링도 종료된 잡이므로 로그 파일까지 함께 정리.
+    // The recent-terminal ring is all terminal jobs too — sweep their logs.
     for (const job of reg.recentTerminal) {
         bytes += deleteOnce(job.logPath);
         purged++;
@@ -180,18 +198,27 @@ function deleteLogFile(logPath: string): number {
 export function renderSidebar(reg: BackgroundRegistry, ctx: UiContext): void {
     const pills: string[] = [];
     let runningCount = 0;
+    const runningLogs = new Set<string>();
 
     for (const job of reg.jobs.values()) {
-        if (job.status !== "running") continue;
+        // Terminal jobs render no pill: their outcome is always surfaced by a
+        // <task-notification>, a kill, or a read — there is no unread state.
+        if (isTerminalStatus(job.status)) continue;
         runningCount++;
+        runningLogs.add(job.logPath);
         const duration = formatDuration(Date.now() - job.startTime);
         const glyph = job.kind === "monitor" ? "◉" : "▶";
         // Show the job's latest output line as live progress; fall back to the
         // command until there's any output. Re-read each tick by the ticker.
-        const progress = readLastLine(job.logPath) || job.command;
+        const progress = sidebarLastLine(job.logPath) || job.command;
         pills.push(
             `${glyph} ${jobLabel(job)}: ${progress.slice(0, PREVIEW_CHARS.progress)} (${duration})`
         );
+    }
+
+    // Drop progress-cache entries for logs no longer tracked.
+    for (const key of sidebarLineCache.keys()) {
+        if (!runningLogs.has(key)) sidebarLineCache.delete(key);
     }
 
     if (pills.length === 0) {
@@ -216,7 +243,30 @@ export function renderSidebar(reg: BackgroundRegistry, ctx: UiContext): void {
         ctx.ui.setStatus("background-jobs", ctx.ui.theme.fg("accent", statusText));
     }
 
-    ensureSidebarTicker(reg, ctx);
+    // The 1 Hz ticker exists to keep running-job durations live; with no
+    // running jobs there is nothing to tick.
+    if (runningCount > 0) ensureSidebarTicker(reg, ctx);
+    else stopSidebarTicker(reg);
+}
+
+/** Per-log cache for the sidebar's live progress line: the 1 Hz ticker would
+ *  otherwise re-read every running job's tail every tick even when output is
+ *  static. statSync first; skip the read when the size is unchanged. */
+const sidebarLineCache = new Map<string, { size: number; lastLine: string }>();
+
+function sidebarLastLine(logPath: string): string {
+    let size: number;
+    try {
+        size = statSync(logPath).size;
+    } catch {
+        sidebarLineCache.delete(logPath);
+        return "";
+    }
+    const cached = sidebarLineCache.get(logPath);
+    if (cached && cached.size === size) return cached.lastLine;
+    const lastLine = readLastLine(logPath);
+    sidebarLineCache.set(logPath, { size, lastLine });
+    return lastLine;
 }
 
 /** Start the live-duration ticker if not already running. */
@@ -243,7 +293,7 @@ export function stopSidebarTicker(reg: BackgroundRegistry): void {
     }
 }
 
-// ─── 통계 ───────────────────────────────────────────────────────────────────────────────────
+// ─── Stats ───────────────────────────────────────────────────────────────
 
 export interface JobStats {
     totalStarted: number;
@@ -258,10 +308,8 @@ export interface JobStats {
 
 export function getStats(reg: BackgroundRegistry): JobStats {
     let running = 0;
-    let killed = 0;
     for (const job of reg.jobs.values()) {
         if (job.status === "running") running++;
-        else if (job.status === "killed") killed++;
     }
     const terminalCount = reg.completedCount + reg.failedCount;
     return {
@@ -269,7 +317,7 @@ export function getStats(reg: BackgroundRegistry): JobStats {
         running,
         completed: reg.completedCount,
         failed: reg.failedCount,
-        killed,
+        killed: reg.killedCount,
         recentTerminal: reg.recentTerminal.length,
         averageDurationMs:
             terminalCount > 0
@@ -279,13 +327,13 @@ export function getStats(reg: BackgroundRegistry): JobStats {
     };
 }
 
-// ─── 내부 헬퍼 ────────────────────────────────────────────────────────────────────────────
+// ─── Internal helpers ──────────────────────────────────────────────────
 
 function terminalDurationMs(job: Job): number {
     return Date.now() - job.startTime;
 }
 
-// ─── 상태 헬퍼 (툴·단축키에서 사용) ───────────────────────────────────────────────────────
+// ─── Status helpers (used by tools and shortcuts) ───────────────────────────────────────────
 
 /** True when the job is currently in the running state. */
 export function isRunning(job: Job): boolean {

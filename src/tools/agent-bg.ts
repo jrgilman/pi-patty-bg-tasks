@@ -19,7 +19,7 @@ import {
     requireExistingCwd as requireCwd,
     startBackgroundJob,
 } from "../lifecycle.ts";
-import { add, createRunningJob, nextJobId, logPathFor } from "../registry.ts";
+import { add, createRunningJob, newJobId, logPathFor } from "../registry.ts";
 import { spawnWithFileOutput, type SpawnResult } from "../spawn.ts";
 import { streamLog } from "../output.ts";
 import { textBlock } from "../format.ts";
@@ -102,8 +102,13 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
 
             assertJobSlot(reg);
 
-            const id = nextJobId(reg);
+            const id = newJobId("agent", reg);
             const logPath = logPathFor(id);
+
+            // The prompt, truncated for display — doubles as the job name so
+            // notifications and the jobs list name the actual task.
+            const promptLabel =
+                p.prompt.slice(0, 100) + (p.prompt.length > 100 ? "…" : "");
 
             // Build continuity prompt.
             const entries = ctx.sessionManager.getEntries();
@@ -143,8 +148,8 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             }
 
             const job = createRunningJob({
-                id, command: `pi -p (background agent)`, pid: spawned.pid,
-                logPath, toolCallId,
+                id, name: promptLabel, command: `pi -p (background agent)`, pid: spawned.pid,
+                logPath, toolCallId, kind: "agent",
             });
             add(reg, job);
 
@@ -159,7 +164,7 @@ export function registerAgentBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             return {
                 content: [textBlock(
                     `Agent running in background with ID: ${id}. Output is being written to: ${logPath}\n` +
-                    `Prompt: ${p.prompt.slice(0, 100)}${p.prompt.length > 100 ? "…" : ""}`
+                    `Prompt: ${promptLabel}`
                 )],
                 details: undefined,
             };

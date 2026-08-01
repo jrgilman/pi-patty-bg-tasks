@@ -17,7 +17,7 @@ import {
     createBashToolDefinition,
     type BashToolDetails,
 } from "@earendil-works/pi-coding-agent";
-import { unlinkSync } from "node:fs";
+import { appendFileSync, unlinkSync } from "node:fs";
 import type { BackgroundRegistry } from "../state.ts";
 import {
     DEFAULT_TIMEOUT_MS,
@@ -26,14 +26,14 @@ import {
     type ForegroundSlot,
     type UiContext,
 } from "../types.ts";
-import { spawnWithFileOutput, killProcessTree } from "../spawn.ts";
+import { spawnWithFileOutput, killProcessTree, type SpawnExit } from "../spawn.ts";
 import { streamLog } from "../output.ts";
 import { showBackgroundHint, clearBackgroundHint } from "../hint.ts";
 import {
     add,
     createRunningJob,
     markStarted,
-    nextJobId,
+    newJobId,
     logPathFor,
     readLogTail,
 } from "../registry.ts";
@@ -43,8 +43,6 @@ import {
     SLEEP_WAIT_GUIDANCE,
     isAutoBackgroundAllowed,
     isBlankCommand,
-    isSignalExit,
-    requestJobDecision,
     requireExistingCwd,
     startBackgroundJob,
 } from "../lifecycle.ts";
@@ -139,7 +137,7 @@ async function runForeground(args: {
 }): Promise<AgentToolResult<BashToolDetails | undefined>> {
     const { toolCallId, command, timeoutMs, signal, onUpdate, ctx, reg, pi } =
         args;
-    const id = nextJobId(reg);
+    const id = newJobId("shell", reg);
     const logPath = logPathFor(id);
 
     // Spawn WITHOUT wiring the turn signal to a process kill. Cooperative
@@ -168,7 +166,7 @@ async function runForeground(args: {
     // Claude Code parity for the turn's abort signal:
     //   - No pause requested  → a genuine cancel (Esc / 'user-cancel'): kill the
     //     process group, like CC's ShellCommand.#abortHandler.
-    //   - Pause already requested → cooperative steering / Ctrl+B / auto-bg
+    //   - Pause already requested → cooperative steering / Ctrl+Shift+B / auto-bg
     //     timeout moving the command to the background: leave it running (this is
     //     CC's 'interrupt' / background path, which never kills).
     // Long-running work is protected the CC way — by auto-backgrounding at the
@@ -183,7 +181,6 @@ async function runForeground(args: {
 
     const slot: ForegroundSlot = { requestPause };
     reg.foreground.set(toolCallId, slot);
-    reg.activeToolCallId = toolCallId;
 
     const job = createRunningJob({
         id,
@@ -198,21 +195,17 @@ async function runForeground(args: {
     reg.jobs.set(id, job);
 
     // Promote the running command to a tracked background job (cooperative
-    // steering / Ctrl+B / auto-bg timeout). Idempotent.
-    const promoteToBackground = (reason: "manual" | "timeout") => {
+    // steering / Ctrl+Shift+B / auto-bg timeout). Idempotent.
+    const promoteToBackground = () => {
         if (handedToBackground) return;
         handedToBackground = true;
         // Clear the foreground slot now (not only in `finally`) so a backgrounded
         // command can't strand a stale slot when cooperative steering tears down
         // the turn right after requesting the pause.
         reg.foreground.delete(toolCallId);
-        if (reg.activeToolCallId === toolCallId) reg.activeToolCallId = null;
         job.isBackgrounded = true;
         markStarted(reg);
         startBackgroundJob({ reg, pi, ctx, job, exit: spawned.exit });
-        if (reason === "timeout") {
-            requestJobDecision({ reg, pi, ctx, job, timeoutMs });
-        }
     };
 
     // Timeout timer.
@@ -220,6 +213,13 @@ async function runForeground(args: {
         if (reg.nonInteractive) return;
         if (!reg.foreground.has(toolCallId)) return;
         if (!isAutoBackgroundAllowed(command)) {
+            // Not eligible for auto-background (e.g. `sleep`) — kill it, but
+            // leave a marker in the log first so the model can tell a timeout
+            // kill apart from a normal failure (Claude Code prepends
+            // "Command timed out after {duration}" to the output).
+            try {
+                appendFileSync(logPath, `Command timed out after ${Math.round(timeoutMs / 1000)}s\n`);
+            } catch { /* best-effort — the kill below still happens */ }
             killProcessTree(spawned.pid, "SIGTERM");
             return;
         }
@@ -239,19 +239,21 @@ async function runForeground(args: {
     // Foreground completion (quick or normal): read output, surface errors.
     // Registry teardown happens in `finally` so no exit path can strand the job.
     const finishForeground = (
-        code: number | null
+        exit: SpawnExit
     ): AgentToolResult<BashToolDetails | undefined> => {
         const output = readLogTail(job, OUTPUT_PREVIEW_CHARS);
-        if (code !== 0 && code !== null && !isSignalExit(code)) {
-            throw new Error(output || `Command exited with code ${code}`);
+        // A signal death (e.g. Esc-cancel killed the process group) is a
+        // deliberate cancel, not a command failure — never an error result.
+        if (exit.signal === null && exit.code !== 0) {
+            throw new Error(output || `Command exited with code ${exit.code ?? 1}`);
         }
         return { content: [textBlock(output || "(no output)")], details: undefined };
     };
 
     try {
         // Quick completion window (2s).
-        const quickResult = await Promise.race<{ code: number | null } | null>([
-            spawned.exit.then((c) => ({ code: c })),
+        const quickResult = await Promise.race<SpawnExit | null>([
+            spawned.exit,
             new Promise<null>((r) => {
                 const t = setTimeout(() => r(null), QUICK_COMPLETION_MS);
                 t.unref();
@@ -259,48 +261,42 @@ async function runForeground(args: {
         ]);
 
         if (quickResult !== null) {
-            return finishForeground(quickResult.code);
+            return finishForeground(quickResult);
         }
 
         // Still running past the quick window — start progress polling and show
-        // the "(ctrl+b to run in background)" hint, like Claude Code.
+        // the "(ctrl+shift+b to run in background)" hint, like Claude Code.
         progressPoller = streamLog(logPath, onUpdate);
         showBackgroundHint(ctx);
         hintShown = true;
 
         // Race: completion vs backgrounding.
         const race = await Promise.race<
-            | { kind: "completed"; code: number | null }
+            | { kind: "completed"; exit: SpawnExit }
             | { kind: "backgrounded"; reason: "manual" | "timeout" }
         >([
-            spawned.exit.then((c) => ({ kind: "completed" as const, code: c })),
+            spawned.exit.then((exit) => ({ kind: "completed" as const, exit })),
             pausePromise.then((reason) => ({ kind: "backgrounded" as const, reason })),
         ]);
 
         if (race.kind === "backgrounded") {
-            promoteToBackground(race.reason);
-            const reason =
-                race.reason === "timeout"
-                    ? ` (auto-backgrounded after ${Math.round(timeoutMs / 1000)}s; still running — check with jobs output if needed)`
-                    : "";
-            return {
-                content: [
-                    textBlock(
-                        `Process backgrounded as ${id}${reason}\nCommand: ${command}\nPID: ${spawned.pid}\nOutput: ${logPath}`
-                    ),
-                ],
-                details: undefined,
-            };
+            promoteToBackground();
+            // Claude Code's exact tool-result strings: a distinct line for a
+            // manual background, one generic line for the timeout path.
+            const text =
+                race.reason === "manual"
+                    ? `Command was manually backgrounded by user with ID: ${id}. Output is being written to: ${logPath}`
+                    : `Command running in background with ID: ${id}. Output is being written to: ${logPath}`;
+            return { content: [textBlock(text)], details: undefined };
         }
 
         // Normal completion.
-        return finishForeground(race.code);
+        return finishForeground(race.exit);
     } finally {
         // Single teardown for every exit path (return, throw, background hand-off).
         cleanup();
         if (hintShown) clearBackgroundHint(ctx);
         reg.foreground.delete(toolCallId);
-        if (reg.activeToolCallId === toolCallId) reg.activeToolCallId = null;
         if (!handedToBackground) {
             reg.jobs.delete(id);
             try { unlinkSync(logPath); } catch { /* best-effort */ }
@@ -319,7 +315,7 @@ function spawnBackground(args: {
     pi: ExtensionAPI;
     ctx: UiContext;
 }): AgentToolResult<BashToolDetails | undefined> {
-    const id = nextJobId(args.reg);
+    const id = newJobId("shell", args.reg);
     const logPath = logPathFor(id);
 
     const spawned = spawnWithFileOutput({
@@ -342,9 +338,7 @@ function spawnBackground(args: {
     return {
         content: [
             textBlock(
-                `Command running in background with ID: ${id}.${
-                    args.name ? ` Name: ${args.name}.` : ""
-                } Output is being written to: ${logPath}`
+                `Command running in background with ID: ${id}. Output is being written to: ${logPath}`
             ),
         ],
         details: undefined,

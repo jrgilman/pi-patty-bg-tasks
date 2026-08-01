@@ -3,10 +3,18 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
+/** How the child ended: an exit code, or the signal that killed it. Node
+ *  reports `code === null` when the child died by signal (external kill, OOM),
+ *  so the signal half is what tells a crash apart from a clean exit. */
+export interface SpawnExit {
+    code: number | null;
+    signal: NodeJS.Signals | null;
+}
+
 export interface SpawnResult {
     pid: number;
     logPath: string;
-    exit: Promise<number | null>;
+    exit: Promise<SpawnExit>;
 }
 
 /**
@@ -30,7 +38,7 @@ export function spawnWithFileOutput(args: {
     errPath?: string;
     signal?: AbortSignal;
 }): SpawnResult {
-    mkdirSync(dirname(args.logPath), { recursive: true });
+    ensureLogDir(args.logPath);
     const outFd = openSync(args.logPath, "w");
     let errFd: number;
     try {
@@ -60,9 +68,14 @@ export function spawnWithFileOutput(args: {
     // Build the exit promise and attach the 'error' listener BEFORE any throw,
     // so an asynchronous spawn failure (ENOENT / EMFILE / EAGAIN) can never
     // surface as an uncaught exception that takes pi down.
-    const exit = new Promise<number | null>((resolve) => {
-        proc.on("close", (code) => resolve(code));
-        proc.on("error", () => resolve(1));
+    const exit = new Promise<SpawnExit>((resolve) => {
+        // Use 'exit' not 'close': 'close' waits for stdio to close, which
+        // includes grandchild processes that inherit file descriptors (e.g.
+        // `sleep 30 &`). 'exit' fires when the shell itself exits, returning
+        // control immediately. Output still flushes fine — the kernel writes
+        // directly to the file fd, no JS drain needed.
+        proc.on("exit", (code, signal) => resolve({ code, signal }));
+        proc.on("error", () => resolve({ code: 1, signal: null }));
     });
 
     if (!proc.pid) {
@@ -88,11 +101,19 @@ export function spawnWithFileOutput(args: {
     return { pid, logPath: args.logPath, exit };
 }
 
+/** The log dir is a constant (registry.LOG_DIR), so create it once per process
+ *  instead of paying a recursive mkdir on every spawn. */
+let logDirCreated = false;
+function ensureLogDir(logPath: string): void {
+    if (logDirCreated) return;
+    mkdirSync(dirname(logPath), { recursive: true });
+    logDirCreated = true;
+}
+
 /**
  * Kill an entire process group via negative PID signal.
  * Falls back to direct PID kill if group kill fails.
- */
-export function killProcessTree(
+ */export function killProcessTree(
     pid: number | undefined,
     signal: NodeJS.Signals = "SIGTERM"
 ): void {

@@ -58,7 +58,7 @@ void describe("bash foreground — Claude Code parity on turn abort", () => {
         assert.ok(!processExists(pid), "process is killed on a genuine cancel (CC parity)");
     });
 
-    void it("a backgrounding pause (steering / Ctrl+B) SURVIVES the abort", async () => {
+    void it("a backgrounding pause (steering / Ctrl+Shift+B) SURVIVES the abort", async () => {
         const { tool, reg, ctx } = harness();
         const ac = new AbortController();
         void tool.execute("t2", { command: "tail -f /dev/null" }, ac.signal, undefined, ctx);
@@ -68,7 +68,7 @@ void describe("bash foreground — Claude Code parity on turn abort", () => {
         const pid = job.pid;
         spawnedPids.push(pid);
 
-        // Cooperative path: a pause is requested (as steering / Ctrl+B does)
+        // Cooperative path: a pause is requested (as steering / Ctrl+Shift+B does)
         // BEFORE the abort — CC's 'interrupt'/background path never kills.
         reg.foreground.get(job.toolCallId)?.requestPause("manual");
         ac.abort();

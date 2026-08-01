@@ -110,6 +110,45 @@ void describe("renderSidebar — pill shows live progress", () => {
         renderSidebar(reg, ctx);
         assert.match(getWidget()?.[0] ?? "", /npm run build/);
     });
+
+    void it("renders no pill for terminal jobs", () => {
+        const reg = new BackgroundRegistry();
+        const logPath = tmpLog("done-job.log", "done\n");
+        const job = createRunningJob({
+            id: "job-1-3",
+            command: "npm test",
+            pid: 125,
+            logPath,
+            toolCallId: "t",
+        });
+        add(reg, job);
+        job.status = "completed";
+        job.exitCode = 0;
+
+        const { ctx, getWidget } = ctxStub();
+        renderSidebar(reg, ctx);
+        assert.equal(getWidget(), undefined, "no pills — a terminal job's outcome is always surfaced elsewhere");
+        assert.equal(reg.sidebarTimer, undefined, "no ticker without running jobs");
+    });
+
+    void it("hides terminal jobs once notified", () => {
+        const reg = new BackgroundRegistry();
+        const logPath = tmpLog("notified-job.log", "done\n");
+        const job = createRunningJob({
+            id: "job-1-4",
+            command: "npm test",
+            pid: 126,
+            logPath,
+            toolCallId: "t",
+        });
+        add(reg, job);
+        job.status = "killed";
+        job.notified = true;
+
+        const { ctx, getWidget } = ctxStub();
+        renderSidebar(reg, ctx);
+        assert.equal(getWidget(), undefined, "no pills at all — widget cleared");
+    });
 });
 
 process.on("exit", () => {

@@ -35,7 +35,6 @@ void describe("input steering (cooperative scheduler)", () => {
         let pauseReason: string | undefined;
         let abortCalled = false;
         const handler = registerAndGetHandler(reg, sent, resubmitted);
-        reg.activeToolCallId = "tc-steer";
         reg.foreground.set("tc-steer", {
             requestPause: (reason) => {
                 pauseReason = reason;
@@ -71,7 +70,6 @@ void describe("input steering (cooperative scheduler)", () => {
         const notifications: string[] = [];
         let abortCalls = 0;
         const handler = registerAndGetHandler(reg, sent, resubmitted);
-        reg.activeToolCallId = "tc-steer2";
         reg.foreground.set("tc-steer2", {
             requestPause: () => {},
         });
@@ -99,7 +97,6 @@ void describe("input steering (cooperative scheduler)", () => {
         const sent: { customType?: string }[] = [];
         const resubmitted: ResubmittedMessage[] = [];
         const handler = registerAndGetHandler(reg, sent, resubmitted);
-        reg.activeToolCallId = null;
 
         const result = await handler(
             { type: "input", text: "any steering", source: "interactive", streamingBehavior: "steer" },
@@ -116,7 +113,6 @@ void describe("input steering (cooperative scheduler)", () => {
         const sent: { customType?: string }[] = [];
         const resubmitted: ResubmittedMessage[] = [];
         const handler = registerAndGetHandler(reg, sent, resubmitted);
-        reg.activeToolCallId = "tc-ext";
         reg.foreground.set("tc-ext", {
             requestPause: () => {},
         });

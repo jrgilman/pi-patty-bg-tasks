@@ -38,24 +38,25 @@ function withTmux(value: string | undefined, fn: () => void): void {
 }
 
 void describe("background hint", () => {
-    void it("shows a ctrl+b hint below the editor when not in tmux", () => {
+    void it("shows a ctrl+shift+b hint below the editor", () => {
         withTmux(undefined, () => {
             const { calls, ctx } = makeCtx();
             showBackgroundHint(ctx);
             assert.equal(calls.length, 1);
             assert.equal(calls[0].options?.placement, "belowEditor");
             const line = calls[0].content?.[0] ?? "";
-            assert.match(line, /ctrl\+b to run in background/);
-            assert.ok(!/twice/.test(line));
+            assert.match(line, /ctrl\+shift\+b to run in background/);
             clearBackgroundHint(ctx); // balance the ref-count
         });
     });
 
-    void it("shows the double-press note inside tmux", () => {
+    void it("shows the same hint inside tmux (no double-press note)", () => {
         withTmux("/tmp/tmux-1/default,123,0", () => {
             const { calls, ctx } = makeCtx();
             showBackgroundHint(ctx);
-            assert.match(calls[0].content?.[0] ?? "", /twice/);
+            const line = calls[0].content?.[0] ?? "";
+            assert.match(line, /ctrl\+shift\+b to run in background/);
+            assert.ok(!/twice/.test(line));
             clearBackgroundHint(ctx);
         });
     });

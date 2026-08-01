@@ -8,7 +8,7 @@
  * makes a third source (named pipe, file replay, …) a drop-in later.
  */
 
-import { spawnWithFileOutput } from "./spawn.ts";
+import { spawnWithFileOutput, type SpawnExit } from "./spawn.ts";
 import { openWsSource, type WsSpec } from "./monitor-ws.ts";
 
 export interface MonitorSource {
@@ -18,8 +18,8 @@ export interface MonitorSource {
     pid: number;
     /** Human-readable label shown in the sidebar / jobs list. */
     label: string;
-    /** Resolves when the source ends (process exit code, or ws close code). */
-    exit: Promise<number | null>;
+    /** Resolves when the source ends (process exit, or ws close as code-only). */
+    exit: Promise<SpawnExit>;
     /** Teardown beyond the standard process kill (closes the ws socket). */
     stop: () => void;
 }
@@ -55,7 +55,8 @@ export function openWsMonitorSource(spec: WsSpec, logPath: string): MonitorSourc
         logPath,
         pid: 0,
         label: `ws ${spec.url}`,
-        exit: ws.exit,
+        // A socket has no signal — the close code maps to the code half.
+        exit: ws.exit.then((code) => ({ code, signal: null })),
         stop: ws.close,
     };
 }

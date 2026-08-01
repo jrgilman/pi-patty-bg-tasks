@@ -1,9 +1,9 @@
 /**
- * 슬래시 커맨드 등록.
+ * Slash command registration.
  *
- *   - /bg: Ctrl+Shift+B와 동일 — 포그라운드 프로세스를 백그라운드로
- *   - /bg-list: 인터랙티브 백그라운드 작업 매니저 열기
- *   - /bg-version: 현재 로드된 확장 버전/경로 확인
+ *   - /bg: same as Ctrl+Shift+B — background the foreground process
+ *   - /bg-list: open the interactive background task manager
+ *   - /bg-version: show the loaded extension version/path
  */
 
 import { readFileSync } from "node:fs";
@@ -20,7 +20,7 @@ import { openBgListPanel } from "./ui.ts";
 const packageJsonPath = fileURLToPath(new URL("../package.json", import.meta.url));
 const packageRoot = dirname(packageJsonPath);
 
-/** 모든 슬래시 커맨드를 등록한다. */
+/** Register all slash commands. */
 export function registerCommands(
     pi: ExtensionAPI,
     reg: BackgroundRegistry
@@ -28,7 +28,7 @@ export function registerCommands(
     pi.registerCommand("bg", {
         description: "Background the current process and hand control to the agent",
         handler: async (_args, ctx) => {
-            takeControl(reg, pi, ctx as unknown as ControlContext);
+            takeControl(reg, ctx as unknown as ControlContext);
         },
     });
 

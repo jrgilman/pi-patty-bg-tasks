@@ -7,23 +7,19 @@
  */
 
 import { statSync as fsStatSync } from "node:fs";
-import { readdir, stat, unlink } from "node:fs/promises";
-import { join as pathJoin } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-    DELIVER_FOLLOWUP,
-    EVENT,
+    isTerminalStatus,
     MAX_CONCURRENT_JOBS,
     type Job,
     type JobStatus,
     type UiContext,
 } from "./types.ts";
 import type { BackgroundRegistry } from "./state.ts";
-import { killProcessTree, processExists } from "./spawn.ts";
-import { LOG_DIR, atConcurrencyLimit, forget, renderSidebar } from "./registry.ts";
+import { killProcessTree, type SpawnExit } from "./spawn.ts";
+import { atConcurrencyLimit, forget, renderSidebar } from "./registry.ts";
 import { watchStalls } from "./monitoring.ts";
-import { enqueueFinished } from "./notify.ts";
-import { formatDuration, jobLabel } from "./format.ts";
+import { markNotified, sendTaskNotification } from "./notify.ts";
 
 // --- Background-job orchestration ----------------------------------------
 
@@ -48,7 +44,7 @@ export function startBackgroundJob(args: {
     pi: ExtensionAPI;
     ctx: UiContext;
     job: Job;
-    exit: Promise<number | null>;
+    exit: Promise<SpawnExit>;
     shouldNotify?: boolean;
     /** Suppress the interactive-prompt stall heuristic (monitors stream their
      *  own output, so a quiet tail is normal, not a stuck prompt). */
@@ -56,13 +52,14 @@ export function startBackgroundJob(args: {
     /** Suppress the oversize auto-kill (persistent log tails are expected to
      *  grow without bound). */
     disableOversizeKill?: boolean;
-    onExit?: (code: number | null) => void;
+    onExit?: (result: SpawnExit) => void;
 }): AbortController {
     ensureCompletionPromise(args.job);
     const jobAc = createJobAbort(args.reg, args.job.id);
     const cancelStall = watchStalls({
         jobId: args.job.id,
         command: args.job.command,
+        name: args.job.name,
         logPath: args.job.logPath,
         pi: args.pi,
         disablePromptStall: args.disablePromptStall,
@@ -70,11 +67,12 @@ export function startBackgroundJob(args: {
         onOversize: () => terminateJobSilently(args.reg, args.job),
     });
     jobAc.signal.addEventListener("abort", cancelStall, { once: true });
-    void args.exit.then((code) => {
-        args.onExit?.(code);
+    void args.exit.then((result) => {
+        args.onExit?.(result);
         completeJob({
             job: args.job,
-            code,
+            code: result.code,
+            signal: result.signal,
             reg: args.reg,
             pi: args.pi,
             ctx: args.ctx,
@@ -89,27 +87,41 @@ export function startBackgroundJob(args: {
 
 /**
  * Standard completion flow after a job exits — abortJob → markTerminal →
- * notifyFinished → forget → renderSidebar. Shared by every tool's exit
- * callback (bash, bash_bg, agent_bg) as the canonical termination protocol.
+ * notify → renderSidebar. Shared by every tool's exit callback (bash,
+ * bash_bg, agent_bg, monitor) as the canonical termination protocol.
+ *
+ * The notification is Claude Code's per-job <task-notification>, sent the
+ * moment the job exits (see notify.ts). A successful send evicts the job
+ * from the live registry (terminal + notified). Jobs whose outcome is
+ * already known (killed silently, or read via jobs output/attach) skip the
+ * notification and linger until the lazy sweep in `jobs list`. Monitors own
+ * their terminal notification (monitor-session, shouldNotify: false) and are
+ * evicted here once it has fired. A `shouldNotify: false` job (bash_bg
+ * `notify: false`) is latched notified WITHOUT sending — "don't notify" IS
+ * notified — so it evicts too and never lingers as a permanent entry.
  */
 export function completeJob(args: {
     job: Job;
     code: number | null | undefined;
+    /** The signal that killed the job, when it died by signal. */
+    signal?: NodeJS.Signals | null;
     reg: BackgroundRegistry;
     pi: ExtensionAPI;
     ctx: UiContext;
     shouldNotify?: boolean;
 }): void {
-    if (args.job.status !== "running") return;
+    if (isTerminalStatus(args.job.status)) return;
     // The caller passes the authoritative Job (the object held in the registry),
     // so no lookup is needed.
     const finished = args.job;
     abortJob(args.reg, finished.id);
-    markTerminal(finished, statusFromExit(args.code), args.code ?? undefined);
+    markTerminal(finished, statusFromExit(args.code, args.signal), args.code ?? undefined);
     if (args.shouldNotify !== false) {
-        notifyFinished({ job: finished, reg: args.reg, pi: args.pi, ctx: args.ctx });
+        sendTaskNotification({ reg: args.reg, pi: args.pi, job: finished });
+    } else {
+        markNotified(finished);
+        forget(args.reg, finished);
     }
-    forget(args.reg, finished);
     renderSidebar(args.reg, args.ctx);
 }
 
@@ -122,11 +134,7 @@ export function markTerminal(
     status: JobStatus,
     exitCode?: number
 ): void {
-    if (
-        job.status === "completed" ||
-        job.status === "failed" ||
-        job.status === "killed"
-    ) {
+    if (isTerminalStatus(job.status)) {
         return;
     }
     job.status = status;
@@ -139,9 +147,15 @@ export function markTerminal(
     delete job.donePromise;
 }
 
-/** Map an exit code to a JobStatus. null is treated as a signal exit (cancel) → completed. */
-export function statusFromExit(code: number | null | undefined): JobStatus {
-    return code === 0 || code === null ? "completed" : "failed";
+/** Map an exit result to a JobStatus: a signal death (external kill, OOM) is
+ *  "killed" (CC marks these killed), exit code 0 is "completed", anything else
+ *  is "failed". */
+export function statusFromExit(
+    code: number | null | undefined,
+    signal?: NodeJS.Signals | null
+): JobStatus {
+    if (signal) return "killed";
+    return code === 0 ? "completed" : "failed";
 }
 
 /**
@@ -158,47 +172,25 @@ export function ensureCompletionPromise(job: Job): void {
 }
 
 /**
- * Mark a job "killed" and set the output-consumed flag, so the exit callback
- * does not emit a spurious completion notification on any termination path.
- * Delegates the flag set to `markOutcomeKnown` so there's a single assignment
- * site for `outputConsumed` (this can't drift if the flag ever gains side
- * effects). `markTerminal` flips status to "killed" first, so the
- * running-guard in `markOutcomeKnown` correctly lets the set through.
+ * Mark a job "killed" and latch the notified flag, so the exit callback does
+ * not emit a spurious completion notification on any termination path.
+ * `markTerminal` flips status to "killed" first; `markNotified` then records
+ * that the outcome needs no <task-notification> (Claude Code parity — a
+ * deliberate kill is intentional cleanup the agent already knows about).
  */
 export function markKilledSilently(job: Job): void {
     markTerminal(job, "killed");
-    markOutcomeKnown(job);
+    markNotified(job);
 }
 
-/**
- * Mark a job's outcome as already-known to the agent — Claude Code's `notified`
- * flag in parity. Called whenever the agent learns the result through any path
- * OTHER than the completion notice itself: `jobs output`, a `job_decide`
- * decision, or `jobs attach` (terminal branch). The pending completion notice
- * is then suppressed — at enqueue time (`enqueueFinished`) AND at flush time
- * (`sendCoalescedNotice`) so a flag flipped while a job is parked mid-turn
- * still takes effect. No-op for a still-running job (the agent hasn't seen the
- * final outcome yet, so the later notice should fire).
- */
-export function markOutcomeKnown(job: Job): void {
-    if (job.status === "running") return;
-    job.outputConsumed = true;
-}
-
-/** Kill a job quietly and abort its registered monitors/timers. */
+/** Kill a job quietly and abort its registered monitors/timers. The notified
+ *  latch is set BEFORE the kill so the exit handler's notification is
+ *  suppressed (Ctrl+Shift+X, jobs kill, session quit). */
 export function terminateJobSilently(reg: BackgroundRegistry, job: Job): void {
+    markNotified(job);
     terminateJob(job);
     markKilledSilently(job);
     abortJob(reg, job.id);
-    if (reg.pendingDecisionJobId === job.id) {
-        reg.pendingDecisionJobId = undefined;
-    }
-}
-
-/** True when the exit code matches a SIGKILL/SIGTERM pattern — lets callers
- *  expecting a clean exit treat it as an intended cancellation. */
-export function isSignalExit(code: number | null | undefined): boolean {
-    return code === 137 || code === 143;
 }
 
 // --- Per-job abort (cleanup) ---------------------------------------------
@@ -226,26 +218,22 @@ export function abortJob(reg: BackgroundRegistry, jobId: string): void {
 
 /**
  * Kill a job — SIGTERM the live process group if the proc handle is present,
- * otherwise signal the recorded PID directly (covers rehydrated jobs that have
- * no proc handle after session restore).
+ * otherwise signal the recorded PID directly (covers jobs whose proc handle
+ * was already dropped).
  */
 export function terminateJob(job: Job): void {
     // Monitors carry a transient teardown hook (follower + ws socket). A ws
     // monitor has pid 0, so the process-tree kill below is a no-op for it and
     // job.stop does the real work; a command monitor needs both.
     job.stop?.();
-    if (job.proc && processExists(job.proc.pid)) {
-        killProcessTree(job.proc.pid, "SIGTERM");
-        return;
-    }
-    if (job.pid > 0 && processExists(job.pid)) {
-        killProcessTree(job.pid, "SIGTERM");
-    }
+    // No liveness probe: killProcessTree already swallows ESRCH, and probing
+    // first would be a TOCTOU race. killProcessTree itself guards pid <= 0.
+    killProcessTree(job.proc?.pid ?? job.pid, "SIGTERM");
 }
 
 // --- Foreground backgrounding --------------------------------------------
 
-/** Richer context for Ctrl+B / `/bg`: the UI plus the turn-control surface
+/** Richer context for Ctrl+Shift+B / `/bg`: the UI plus the turn-control surface
  *  (idle check and whether a user message is already queued). */
 export type ControlContext = UiContext & {
     isIdle(): boolean;
@@ -253,62 +241,40 @@ export type ControlContext = UiContext & {
 };
 
 /**
- * Flip the active foreground command into the background. Pure mechanic — no
- * toast, no agent message. Returns false when there is nothing in the
- * foreground to pause. Callers compose the messaging.
+ * Flip every running foreground command into the background — Claude Code's
+ * Ctrl+B `backgroundAll`. Pure mechanic — no toast, no agent message. Returns
+ * false when there is nothing in the foreground to pause. Callers compose the
+ * messaging.
  */
-export function pauseActiveForeground(reg: BackgroundRegistry, ctx: UiContext): boolean {
-    if (!reg.activeToolCallId) return false;
-    const toolCallId = reg.activeToolCallId;
-    const slot = reg.foreground.get(toolCallId);
-    if (!slot) return false;
-
-    slot.requestPause("manual");
-    reg.foreground.delete(toolCallId);
-    if (reg.activeToolCallId === toolCallId) reg.activeToolCallId = null;
+export function pauseAllForeground(reg: BackgroundRegistry, ctx: UiContext): boolean {
+    if (reg.foreground.size === 0) return false;
+    for (const slot of reg.foreground.values()) {
+        slot.requestPause("manual");
+    }
+    reg.foreground.clear();
     renderSidebar(reg, ctx);
     return true;
 }
 
-/** Tell the agent a command was backgrounded so it acknowledges and continues. */
-export function sendBackgroundNotice(pi: ExtensionAPI): void {
-    pi.sendMessage(
-        {
-            customType: EVENT.background,
-            content:
-                `Command was manually backgrounded by user. ` +
-                `Output is being captured. ` +
-                `You can continue working — use the jobs tool to check on it later.`,
-            display: true,
-        },
-        DELIVER_FOLLOWUP
-    );
-}
-
-/** Move the current foreground command to the background and send the agent a follow-up. */
+/** Move the current foreground command(s) to the background. The tool result
+ *  already tells the model what happened (CC's exact `Command was manually
+ *  backgrounded by user with ID: ...` string), so no synthetic agent message
+ *  is sent — only the UI toast. */
 export function backgroundActiveForeground(
     reg: BackgroundRegistry,
-    pi: ExtensionAPI,
-    ctx: UiContext,
-    options?: { notifyAgent?: boolean }
+    ctx: UiContext
 ): boolean {
-    if (!pauseActiveForeground(reg, ctx)) return false;
+    if (!pauseAllForeground(reg, ctx)) return false;
     ctx.ui.notify("▶ Backgrounded — continuing.", "info");
-
-    // Cooperative steering (input.ts) delivers the user's own message as the
-    // follow-up, so it suppresses this synthetic notice to avoid a duplicate
-    // agent message and an extra turn. Ctrl+Shift+B / /bg have no user text and
-    // keep it.
-    if (options?.notifyAgent === false) return true;
-    sendBackgroundNotice(pi);
     return true;
 }
 
-/** Outcome of a Ctrl+B / `/bg` control-handover. */
+/** Outcome of a Ctrl+Shift+B / `/bg` control-handover. */
 export type ControlOutcome = "backgrounded" | "queued" | "nothing";
 
 /**
- * Claude Code's Ctrl+B, faithfully: background the running foreground command.
+ * Claude Code's Ctrl+B, faithfully (on Ctrl+Shift+B here, since pi owns
+ * Ctrl+B): background ALL running foreground commands (CC's `backgroundAll`).
  *
  * It deliberately does NOT call ctx.abort(): in pi, aborting restores any queued
  * message to the editor (unsent), renders a scary "Operation aborted", AND kills
@@ -318,11 +284,9 @@ export type ControlOutcome = "backgrounded" | "queued" | "nothing";
  */
 export function takeControl(
     reg: BackgroundRegistry,
-    pi: ExtensionAPI,
     ctx: ControlContext
 ): ControlOutcome {
-    if (pauseActiveForeground(reg, ctx)) {
-        sendBackgroundNotice(pi);
+    if (pauseAllForeground(reg, ctx)) {
         ctx.ui.notify("▶ Backgrounded — continuing.", "info");
         return "backgrounded";
     }
@@ -336,48 +300,6 @@ export function takeControl(
 
     ctx.ui.notify("No running process to background.", "warning");
     return "nothing";
-}
-
-// --- Completion notification ---------------------------------------------
-
-/**
- * Notify the agent that a job finished. When outputConsumed is true (e.g. a
- * jobs attach already consumed the output) no notification is sent and the job
- * is only cleaned up. The caller calls registry.forget() right after.
- *
- * Completions are coalesced (see notify.ts): a lone finish reads like a single
- * line, but a burst collapses into one summary instead of a wall of notices.
- */
-export function notifyFinished(args: {
-    job: Job;
-    reg: BackgroundRegistry;
-    pi: ExtensionAPI;
-    ctx: UiContext;
-}): void {
-    enqueueFinished(args.reg, args.pi, args.ctx, args.job);
-}
-
-/**
- * Record a timeout backgrounding: a lightweight UI toast for the human. Claude
- * Code's behavior on timeout is to silently slide the command into the
- * background — no forced turn, no decision request, no steering message. The
- * bash tool's own "Process backgrounded as job-X" result is the agent's
- * notification that the command moved; a later completion appears as a passive
- * task-notification. We keep only a subtle toast so the human sees something
- * happened. The agent can still use `job_decide` / `jobs` if it wants, but it
- * is never interrupted to do so.
- */
-export function requestJobDecision(args: {
-    reg: BackgroundRegistry;
-    pi: ExtensionAPI;
-    ctx: UiContext;
-    job: Job;
-    timeoutMs: number;
-}): void {
-    args.reg.pendingDecisionJobId = args.job.id;
-    const label = `"${jobLabel(args.job)}"`;
-    const elapsed = formatDuration(args.timeoutMs);
-    args.ctx.ui.notify(`Backgrounded ${label} after ${elapsed}; still running.`, "info");
 }
 
 // --- Helpers -------------------------------------------------------------
@@ -467,38 +389,6 @@ export function detectBlockedSleep(command: string): string | null {
     return null;
 }
 
-// --- Rehydration (session restore) ---------------------------------------
-
-/**
- * Validate a job rehydrated from a serialized session entry. If the PID is
- * dead, force the job to a terminal state.
- */
-export function reviveAndValidate(
-    _reg: BackgroundRegistry,
-    job: Job
-): "alive" | "completed" {
-    if (job.status !== "running") return "completed";
-    // A ws monitor (pid 0) has no process to revive — its socket cannot survive
-    // a restart — so it is always terminal. A command monitor falls through to
-    // the generic pid-liveness check below: if its child is still alive in this
-    // process it stays "running" (killable/inspectable via jobs, though its
-    // follower is gone); otherwise it is marked terminal like any dead job.
-    if (job.kind === "monitor" && job.pid <= 0) {
-        markTerminal(job, "failed");
-        return "completed";
-    }
-    // A job spawned by a *different* pi process (a full restart, not a /reload)
-    // cannot be safely managed — the OS may have recycled its PID, and signalling
-    // it would hit an unrelated process group. Only revive jobs from the current
-    // process. Job ids are `job-<spawning-pid>-<n>`.
-    const spawnedPid = Number.parseInt(job.id.split("-")[1] ?? "", 10);
-    if (spawnedPid !== process.pid || !processExists(job.pid)) {
-        markTerminal(job, "failed");
-        return "completed";
-    }
-    return "alive";
-}
-
 // --- Non-interactive mode detection --------------------------------------
 
 /** Detect whether pi is running non-interactively (print / non-TTY). */
@@ -508,33 +398,4 @@ export function detectNonInteractive(
 ): boolean {
     if (!stdinIsTTY) return true;
     return argv.includes("-p") || argv.includes("--print");
-}
-
-// --- Cleanup -------------------------------------------------------------
-
-/**
- * Remove background log files older than 24 hours. Scans only the dedicated
- * LOG_DIR (not all of /tmp) and runs off the event loop via fs/promises, so it
- * never blocks session start. Never rejects.
- */
-export async function cleanupStaleRuntimeArtifacts(): Promise<void> {
-    const MAX_AGE_MS = 24 * 60 * 60 * 1000;
-    const now = Date.now();
-    let names: string[];
-    try {
-        names = await readdir(LOG_DIR);
-    } catch {
-        return; // dir doesn't exist yet — nothing to clean
-    }
-    await Promise.all(
-        names.map(async (name) => {
-            const fullPath = pathJoin(LOG_DIR, name);
-            try {
-                const { mtimeMs } = await stat(fullPath);
-                if (now - mtimeMs > MAX_AGE_MS) await unlink(fullPath);
-            } catch {
-                /* already gone */
-            }
-        })
-    );
 }

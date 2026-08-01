@@ -13,14 +13,14 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync, mkdirSync, rmSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { killProcessTree, processExists } from "../proc.ts";
+import { killProcessTree, processExists } from "../spawn.ts";
 import { BackgroundRegistry } from "../state.ts";
 import {
     add,
     cleanupTerminal,
     forget,
     getStats,
-    nextJobId,
+    newJobId,
 } from "../registry.ts";
 import { formatJobLine } from "../format.ts";
 import type { Job } from "../types.ts";
@@ -29,7 +29,7 @@ const TMP = "/tmp/pi-patty-features-test";
 
 function makeJob(overrides: Partial<Job> = {}): Job {
     return {
-        id: nextJobId({ counter: 0 } as BackgroundRegistry),
+        id: newJobId("shell"),
         command: "echo hello",
         pid: 1,
         startTime: Date.now(),

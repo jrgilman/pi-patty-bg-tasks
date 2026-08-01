@@ -16,6 +16,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { StringEnum, Type } from "@earendil-works/pi-ai";
 import type { BackgroundRegistry } from "../state.ts";
 import {
+    isTerminalStatus,
     OUTPUT_PREVIEW_CHARS,
     PREVIEW_CHARS,
     type UiContext,
@@ -24,23 +25,22 @@ import { processExists } from "../spawn.ts";
 import {
     cleanupTerminal,
     findJob,
+    forget,
     getStats,
     readLogTail,
     renderSidebar,
 } from "../registry.ts";
-import { formatDuration, formatJobLine, jobLabel, textBlock } from "../format.ts";
+import { formatDuration, formatJobLine, jobLabel, oneLine, textBlock } from "../format.ts";
 import { streamLog } from "../output.ts";
 import { searchLogs } from "../log-search.ts";
+import { markNotified } from "../notify.ts";
 import {
     ensureCompletionPromise,
-    markOutcomeKnown,
     markTerminal,
     terminateJobSilently,
 } from "../lifecycle.ts";
 
-/** `jobs` 툴을 등록한다. */
-
-
+/** Register the `jobs` tool. */
 export function registerJobsTool(
     pi: ExtensionAPI,
     reg: BackgroundRegistry
@@ -112,9 +112,15 @@ export function registerJobsTool(
     });
 }
 
-// ─── list: 모든 잡 나열 ──────────────────────────────────────────────────────────────────────
+// ─── list: show all jobs ─────────────────────────────────────────────────
 
 function listAction(reg: BackgroundRegistry): AgentToolResult<undefined> {
+    // Lazy eviction sweep: terminal jobs whose outcome was already surfaced
+    // (notified — via the <task-notification>, a kill, or a read) leave the
+    // live registry here. Their output logs stay on disk.
+    for (const job of Array.from(reg.jobs.values())) {
+        if (isTerminalStatus(job.status) && job.notified) forget(reg, job);
+    }
     const running = Array.from(reg.jobs.values()).filter(
         (j) => j.status === "running"
     );
@@ -135,18 +141,18 @@ function listAction(reg: BackgroundRegistry): AgentToolResult<undefined> {
     };
 }
 
-// ─── output: 특정 잡의 출력 꼬리 읽기 ────────────────────────────────────────────────────────
+// ─── output: read a job's log tail ───────────────────────────────────────
 
 async function outputAction(
     reg: BackgroundRegistry,
     jobId: string
 ): Promise<AgentToolResult<undefined>> {
     const job = findJob(reg, jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
-    // The agent just read this job's outcome — suppress the completion notice
-    // so we don't re-tell it what it already knows (Claude Code's `notified`
-    // flag). No-op while still running.
-    markOutcomeKnown(job);
+    if (!job) throw new Error(`No task found with ID: ${jobId}`);
+    // CC's TaskOutputTool: a successful read of a TERMINAL job's output marks
+    // it notified, suppressing the separate <task-notification>. Peeking at a
+    // still-running job does NOT mark — its completion must still notify.
+    if (isTerminalStatus(job.status)) markNotified(job);
     const out = readLogTail(job, OUTPUT_PREVIEW_CHARS).trimEnd();
     const label = jobLabel(job);
     return {
@@ -161,7 +167,7 @@ async function outputAction(
     };
 }
 
-// ─── kill: 특정 잡 종료 ─────────────────────────────────────────────────────────────────────────────
+// ─── kill: terminate a job ───────────────────────────────────────────────
 
 async function killAction(
     reg: BackgroundRegistry,
@@ -169,26 +175,24 @@ async function killAction(
     ctx: UiContext
 ): Promise<AgentToolResult<undefined>> {
     const job = findJob(reg, jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
-    if (job.status !== "running") {
+    if (!job) throw new Error(`No task found with ID: ${jobId}`);
+    if (isTerminalStatus(job.status)) {
         throw new Error(`Job is not running: ${job.id}`);
     }
+    // terminateJobSilently latches `notified` BEFORE the kill, so the exit
+    // handler skips the <task-notification> — this result IS the outcome.
     terminateJobSilently(reg, job);
     renderSidebar(reg, ctx);
-    const isWsMonitor = job.kind === "monitor" && job.pid <= 0;
+    // Claude Code's TaskStopTool result string (command collapsed to one line).
     return {
         content: [
-            textBlock(
-                isWsMonitor
-                    ? `Closed monitor ${jobLabel(job)}`
-                    : `Sent SIGTERM to ${jobLabel(job)} (process group)`
-            ),
+            textBlock(`Successfully stopped task: ${job.id} (${oneLine(job.command)})`),
         ],
         details: undefined,
     };
 }
 
-// ─── attach: 완료까지 대기 후 출력 ─────────────────────────────────────────────────────────────────
+// ─── attach: follow live output until completion ─────────────────────────
 
 async function attachAction(
     reg: BackgroundRegistry,
@@ -199,18 +203,16 @@ async function attachAction(
     ctx: UiContext
 ): Promise<AgentToolResult<undefined>> {
     const job = findJob(reg, jobId);
-    if (!job) throw new Error(`Job not found: ${jobId}`);
+    if (!job) throw new Error(`No task found with ID: ${jobId}`);
     const label = jobLabel(job);
 
-    const skipWait =
-        reg.pendingDecisionJobId === job.id && job.status === "running";
-
-    if (job.status === "running" && waitForCompletion && !skipWait) {
+    if (job.status === "running" && waitForCompletion) {
         ensureCompletionPromise(job);
         // We're actively following this job — suppress its separate completion
-        // notice so the attach result is the single notification. Undone on the
-        // abort path below, so a job we detach from still reports when it ends.
-        job.outputConsumed = true;
+        // notification so the attach result is the single notification. Undone
+        // on the abort path below, so a job we detach from still reports when
+        // it ends.
+        job.notified = true;
 
         // Bail early if the OS process already died.
         if (job.pid > 0 && !processExists(job.pid)) {
@@ -245,8 +247,8 @@ async function attachAction(
 
         if (job.status === "running") {
             // Aborted before completion — we never reported the finish, so let
-            // the job's own completion notice fire later.
-            job.outputConsumed = false;
+            // the job's own completion notification fire later.
+            job.notified = false;
             return {
                 content: [
                     textBlock(
@@ -260,18 +262,18 @@ async function attachAction(
 
     const message = `${label} finished. Status: ${job.status}`;
     ctx.ui.notify(message, job.status === "failed" ? "error" : "info");
-    // The attach result IS the outcome notification — mark it known so any
-    // pending completion notice is suppressed (CC `notified` parity). Covers
-    // both the "attached to an already-terminal job" and "waited then
-    // finished" cases; idempotent with the running-branch set at line 213.
-    markOutcomeKnown(job);
+    // The attach result IS the outcome notification — mark it notified so the
+    // <task-notification> is suppressed (CC parity). Covers both the "attached
+    // to an already-terminal job" and "waited then finished" cases; idempotent
+    // with the running-branch set above.
+    markNotified(job);
     return {
         content: [textBlock(`${message}. Use jobs output for the full log.`)],
         details: undefined,
     };
 }
 
-// ─── search (v0.2 신규) ─────────────────────────────────────────────
+// ─── search ──────────────────────────────────────────────────────────────
 
 const SEARCH_DISPLAY_LIMIT_PER_JOB = 20;
 
@@ -323,7 +325,7 @@ async function searchAction(
     };
 }
 
-// ─── cleanup (v0.2 신규) ────────────────────────────────────────────
+// ─── cleanup ─────────────────────────────────────────────────────────────
 
 function cleanupAction(
     reg: BackgroundRegistry,
@@ -342,7 +344,7 @@ function cleanupAction(
     };
 }
 
-// ─── stats (v0.2 신규) ──────────────────────────────────────────────
+// ─── stats ───────────────────────────────────────────────────────────────
 
 function statsAction(reg: BackgroundRegistry): AgentToolResult<undefined> {
     const s = getStats(reg);

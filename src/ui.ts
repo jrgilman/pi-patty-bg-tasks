@@ -106,6 +106,7 @@ function getJobList(reg: BackgroundRegistry): Job[] {
 
 function statusIcon(job: Job): string {
     switch (job.status) {
+        case "pending": return "◌";
         case "running": return "▶";
         case "completed": return "✓";
         case "failed": return "✗";

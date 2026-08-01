@@ -3,20 +3,20 @@
 // `bash_bg` tool — start a bash command in the background immediately.
 //
 // Unlike the `bash` override, there is no race/timeout/quick-completion
-// window. The child runs in the background for its lifetime and
-// notifyFinished is invoked on completion. This is a thin wrapper over the
+// window. The child runs in the background for its lifetime and a
+// <task-notification> is sent on completion. This is a thin wrapper over the
 // file-fd spawn backend plus the per-job AbortController + stall watcher.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@earendil-works/pi-ai";
+import { appendFileSync } from "node:fs";
 import type { BackgroundRegistry } from "../state.ts";
-import { type UiContext } from "../types.ts";
-import { spawnWithFileOutput } from "../spawn.ts";
-import { add, createRunningJob, nextJobId, logPathFor, renderSidebar } from "../registry.ts";
+import { isTerminalStatus, type UiContext } from "../types.ts";
+import { killProcessTree, spawnWithFileOutput } from "../spawn.ts";
+import { add, createRunningJob, newJobId, logPathFor } from "../registry.ts";
 import {
     assertJobSlot, detectBlockedSleep, isAutoBackgroundAllowed, isBlankCommand,
-    requestJobDecision, requireExistingCwd, SLEEP_WAIT_GUIDANCE, startBackgroundJob,
-    terminateJobSilently,
+    requireExistingCwd, SLEEP_WAIT_GUIDANCE, startBackgroundJob,
 } from "../lifecycle.ts";
 import { textBlock } from "../format.ts";
 
@@ -56,7 +56,7 @@ export function registerBashBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): v
             requireExistingCwd(ctx2.cwd);
             assertJobSlot(reg);
 
-            const id = nextJobId(reg);
+            const id = newJobId("shell", reg);
             const logPath = logPathFor(id);
             const spawned = spawnWithFileOutput({
                 command: p.command, cwd: ctx2.cwd, logPath,
@@ -72,16 +72,24 @@ export function registerBashBgTool(pi: ExtensionAPI, reg: BackgroundRegistry): v
                 shouldNotify: p.notify !== false,
             });
 
-            // Optional timeout — route an overrun into the decision flow.
+            // Optional timeout — an overrun kills commands that were never
+            // eligible for auto-backgrounding (e.g. `sleep`); anything else
+            // simply keeps running, like Claude Code (no decision turn).
             if (p.timeout) {
                 const timer = setTimeout(() => {
-                    if (job.status !== "running" || reg.nonInteractive) return;
+                    if (isTerminalStatus(job.status) || reg.nonInteractive) return;
                     if (!isAutoBackgroundAllowed(p.command)) {
-                        terminateJobSilently(reg, job);
-                        renderSidebar(reg, ctx2);
-                        return;
+                        // Mirror the foreground timeout-kill: mark the log first
+                        // so the model can tell a timeout kill apart from a
+                        // normal failure, then kill WITH a notification (the
+                        // exit handler maps the signal death to "killed" and
+                        // sends the <task-notification>) — the agent must learn
+                        // its command was timeout-killed.
+                        try {
+                            appendFileSync(logPath, `Command timed out after ${p.timeout}s\n`);
+                        } catch { /* best-effort — the kill below still happens */ }
+                        killProcessTree(job.pid, "SIGTERM");
                     }
-                    requestJobDecision({ reg, pi, ctx: ctx2, job, timeoutMs: p.timeout! * 1000 });
                 }, p.timeout * 1000);
                 (timer as NodeJS.Timeout).unref();
                 jobAc.signal.addEventListener("abort", () => clearTimeout(timer), { once: true });

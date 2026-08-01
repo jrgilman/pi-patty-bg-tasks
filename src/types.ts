@@ -5,8 +5,6 @@
 import type { ChildProcess } from "node:child_process";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 
-export const PERSISTED_STATE_SCHEMA_VERSION = 2;
-
 // --- Configuration constants ---
 export const DEFAULT_TIMEOUT_MS = 120_000;
 export const QUICK_COMPLETION_MS = 2_000;
@@ -18,12 +16,6 @@ export const MAX_LOG_BYTES = 100 * 1024 * 1024;
 export const OUTPUT_PREVIEW_CHARS = 12_000;
 export const RECENT_TERMINAL_KEEP = 20;
 export const MAX_CONCURRENT_JOBS = 16;
-/** Coalescing window for background-job completion notices. Completions within
- *  this window collapse into one summary message instead of one line each, so a
- *  burst of finished jobs doesn't dump a wall of `[job-finished]` lines. Kept
- *  sub-second so a lone job's notice isn't perceptibly delayed; jobs launched
- *  together still finish within tens of ms of each other and coalesce. */
-export const JOB_FINISH_COALESCE_MS = 400;
 
 // --- Monitor (streaming-event) constants ---
 /** Poll cadence for the line-accurate follower. Lines read within one tick are
@@ -48,11 +40,27 @@ export const PREVIEW_CHARS = {
 } as const;
 
 // --- Domain types ---
-export type JobStatus = "running" | "completed" | "failed" | "killed";
+/** Claude Code's task-status enum. "pending" exists for parity (a task that is
+ *  registered but not yet started); every spawn path here starts "running". */
+export type JobStatus = "pending" | "running" | "completed" | "failed" | "killed";
 
-/** What kind of background job this is. "shell" is the default (bash/bash_bg/
- *  agent_bg); "monitor" is a streaming-event watch (the monitor tool). */
-export type JobKind = "shell" | "monitor";
+/** True once the job has reached a terminal state (completed | failed | killed). */
+export function isTerminalStatus(status: JobStatus): boolean {
+    return status === "completed" || status === "failed" || status === "killed";
+}
+
+/** What kind of background job this is. "shell" is the default (bash/bash_bg);
+ *  "agent" is a background pi -p process (agent_bg); "monitor" is a
+ *  streaming-event watch (the monitor tool). */
+export type JobKind = "shell" | "agent" | "monitor";
+
+/** Claude Code's typed task-id prefixes — one letter per kind, followed by 8
+ *  random base36 chars (e.g. `b7f3k9a2x1`). See registry.newJobId. */
+export const JOB_ID_PREFIX: Record<JobKind, string> = {
+    shell: "b",
+    monitor: "m",
+    agent: "a",
+};
 
 export interface Job {
     id: string;
@@ -67,26 +75,19 @@ export interface Job {
     toolCallId: string;
     donePromise?: Promise<void>;
     resolveDone?: () => void;
-    outputConsumed?: boolean;
+    /** Exactly-once latch for the terminal <task-notification> (Claude Code's
+     *  `notified` flag). Set BEFORE the notification send, before a deliberate
+     *  kill, and when the agent reads the outcome via jobs output/attach — any
+     *  path that already surfaced the result suppresses the notification. */
+    notified?: boolean;
     isBackgrounded: boolean;
-    /** Defaults to "shell" when absent (back-compat with persisted jobs). */
+    /** Defaults to "shell" when absent. */
     kind?: JobKind;
-    /** Transient teardown hook (follower + ws socket). Never persisted. */
+    /** Transient teardown hook (follower + ws socket). */
     stop?: () => void;
-    /** Wall-clock finish time, stamped when queued for a completion notice so a
-     *  coalesced notice reports the true duration, not the flush time. */
-    endedAt?: number;
 }
 
 export type BackgroundReason = "manual" | "timeout";
-
-/** A monitor's terminal notice (stream ended / stopped / failed), coalesced
- *  with job completions into one turn-boundary summary. */
-export interface MonitorEnd {
-    description: string;
-    summary: string;
-    failed: boolean;
-}
 
 /** Transient handle for an in-flight foreground bash command, keyed by
  *  toolCallId in the registry. Ctrl+Shift+B and the timeout timer call
@@ -97,13 +98,8 @@ export interface ForegroundSlot {
 
 // --- Event types ---
 export const EVENT = {
-    state: "background-tasks-state",
     stall: "bg-stall",
-    timeout: "bg-timeout",
-    attach: "bg-attach",
-    background: "bg-manual",
-    agentResume: "agent-resume",
-    jobFinished: "job-finished",
+    taskNotification: "task-notification",
     monitorEvent: "bg-monitor-event",
 } as const;
 
@@ -111,15 +107,16 @@ export type EventName = (typeof EVENT)[keyof typeof EVENT];
 
 // --- Deliver options ---
 /** Steer the message into the current/next turn AND wake the agent.
- *  Use when the message IS the answer to a question the agent must address
- *  now (a finished background job while idle, a deadline decision). */
+ *  pi queues it while the agent is streaming and delivers it at the next
+ *  tool-call boundary — Claude Code's 'next' priority. Use when the message
+ *  IS something the agent must react to now: a background job's terminal
+ *  <task-notification>, a stall warning, a deadline decision. */
 export const DELIVER_STEER = { deliverAs: "steer", triggerTurn: true } as const;
 /** Queue the message behind the current turn as a PASSIVE follow-up. The agent
  *  picks it up on its next natural turn (when the user re-engages or the
- *  current turn ends) but it does NOT spawn a new turn on its own. This mirrors
- *  Claude Code's `priority: 'later'` task-notification delivery: completions,
- *  background notices, and monitor stream events are informational and never
- *  force an unsolicited acknowledgment or starve user input.
+ *  current turn ends) but it does NOT spawn a new turn on its own. Monitor
+ *  stream events are informational and never force an unsolicited
+ *  acknowledgment or starve user input.
  *  NOTE: sendMessage-only — `pi.sendUserMessage` rejects `triggerTurn` and
  *  takes just `{ deliverAs: "followUp" }`. */
 export const DELIVER_FOLLOWUP = { deliverAs: "followUp", triggerTurn: false } as const;

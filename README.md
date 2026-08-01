@@ -16,7 +16,7 @@
   <img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
-**Your agent shouldn't twiddle its thumbs while the build runs.** This is Claude Code's background-task experience, brought to Pi: kick off a long command, and instead of blocking the whole session, it slips into the background while the agent keeps working. Auto-background after 120 seconds, instant background with Ctrl+B, output capture, stall detection, and a full job manager — all in one extension.
+**Your agent shouldn't twiddle its thumbs while the build runs.** This is Claude Code's background-task experience, brought to Pi: kick off a long command, and instead of blocking the whole session, it slips into the background while the agent keeps working. Auto-background after 120 seconds, instant background with Ctrl+Shift+B, output capture, stall detection, and a full job manager — all in one extension.
 
 ## Install
 
@@ -36,7 +36,7 @@ Needs Pi v0.37+. That's the only requirement — there are **no external depende
 
 **Blocked sessions are over.** Dev servers, test suites, builds — anything still chugging after 120 seconds gets quietly moved to the background. The agent gets a heads-up and carries on with the next thing instead of staring at a spinner. Want it gone sooner? Background any command by hand, any time.
 
-**It feels like Claude Code, because it's modeled on Claude Code.** The whole background/foreground dance — Ctrl+B to background, output capture, completion pings, stall detection — is built directly on Claude Code's implementation. Same message format, same terminal-native icons, same "agent never stops moving" flow. If you've got the muscle memory, it's already here.
+**It feels like Claude Code, because it's modeled on Claude Code.** The whole background/foreground dance — Ctrl+Shift+B to background, output capture, completion pings, stall detection — is built directly on Claude Code's implementation. Same message format, same terminal-native icons, same "agent never stops moving" flow. If you've got the muscle memory, it's already here.
 
 **A real job manager, not an afterthought.** `/bg-list` opens an interactive task manager where you can list jobs, peek at their output, kill the runaways, or attach and wait for a result.
 
@@ -62,13 +62,13 @@ jobs({ action: "search", pattern: "error|warning" })
 agent_bg({ prompt: "Refactor the auth module" })
 ```
 
-Hit **Ctrl+B** whenever a command is running to background it on the spot — a dim `(ctrl+b to run in background)` hint appears under your input once the command has been going a couple of seconds. The agent gets notified and is back to work before you've let go of the keys.
+Hit **Ctrl+Shift+B** whenever commands are running to background them all on the spot — a dim `(ctrl+shift+b to run in background)` hint appears under your input once a command has been going a couple of seconds. The agent gets notified and is back to work before you've let go of the keys.
 
 ## Tools
 
 ### bash (override)
 
-The built-in bash tool, with a survival instinct. Commands run normally — but if one blows past 120 seconds, it's automatically backgrounded and the agent is asked what to do next (keep it, kill it, or check the output) via `job_decide`.
+The built-in bash tool, with a survival instinct. Commands run normally — but if one blows past 120 seconds, it silently slides into the background. No decision prompt, no forced turn: the tool result itself (`Command running in background with ID: …`) tells the agent where the output is going.
 
 | Parameter | Description |
 |-----------|-------------|
@@ -84,7 +84,7 @@ When you already know it's a long one. Starts a command in the background immedi
 |-----------|-------------|
 | `command` | Shell command to run |
 | `name` | Optional human-readable label for the job |
-| `timeout` | Optional timeout in seconds; triggers the same auto-background decision flow |
+| `timeout` | Optional timeout in seconds; an overrun kills only commands that can't be auto-backgrounded (e.g. `sleep`) — anything else keeps running |
 | `notify` | Send a completion notification (default: true) |
 
 ### jobs
@@ -100,15 +100,6 @@ Mission control for everything running in the background: list, read output, kil
 | `search` | Regex search across all job logs |
 | `cleanup` | Purge completed/failed jobs and reclaim disk |
 | `stats` | Aggregate metrics: total started, running, completed, failed, average duration |
-
-### job_decide
-
-The agent's answer to an auto-backgrounded command. This prompt lands the moment the 120-second timer fires.
-
-| Parameter | Description |
-|-----------|-------------|
-| `jobId` | The backgrounded job's ID |
-| `decision` | `keep` (let it run), `kill` (terminate), or `check` (inspect output first) |
 
 ### agent_bg
 
@@ -152,8 +143,7 @@ Keep your hands on the keyboard.
 
 | Shortcut | Action |
 |----------|--------|
-| **Ctrl+B** | Background the running foreground command — agent keeps working (matches Claude Code). Inside tmux, press it twice (tmux owns Ctrl+B). |
-| **Ctrl+Shift+B** | Same as Ctrl+B (alias) |
+| **Ctrl+Shift+B** | Background all running foreground commands — agent keeps working (Claude Code's Ctrl+B; pi reserves Ctrl+B itself for editor cursor-left). Inside tmux without extended-keys, use `/bg` instead. |
 | **Ctrl+Shift+J** | Open the background task manager |
 | **Shift+Down** | Open the background task manager |
 | **Ctrl+Shift+X** | Kill the most recent running job |
@@ -164,7 +154,7 @@ Prefer slashes? Same powers, different door.
 
 | Command | Description |
 |---------|-------------|
-| `/bg` | Background the current process (same as Ctrl+B) |
+| `/bg` | Background the current process (same as Ctrl+Shift+B) |
 | `/bg-list` | Open the interactive background task manager |
 | `/bg-version` | Show the loaded extension version/path for reload diagnostics |
 
@@ -175,22 +165,31 @@ No magic, just a tidy state machine:
 ```
 Command starts (direct Node.js child_process.spawn)
   → Done in <2s?           Return the result immediately
-  → Still running at 120s? Auto-background → agent gets a job_decide prompt
-  → You press Ctrl+B?       Background immediately → agent continues
+  → Still running at 120s? Auto-background → the tool result carries the new task ID
+  → You press Ctrl+Shift+B?  Background immediately → agent continues
 
 Background job running
   → Output captured to /tmp/pi-bg/<id>.log via file descriptor
-  → Stall detection: if the output looks like an interactive prompt, the agent is warned
+  → Stall detection: if the output goes quiet and the tail looks like an interactive prompt, the agent is warned
   → Oversize detection: if the output blows past the limit, the job is killed
-  → On completion: agent gets a notification with status + output path
+  → On completion: an individual <task-notification> lands mid-turn with status + output path
 ```
 
 Background jobs run as detached Node.js child processes with their stdout/stderr wired
 straight to a log file descriptor — the exact pattern Claude Code uses. No tmux, no
 external process manager, nothing standing between your command and its log. Up to
 **16 background jobs** run at once; ask for a 17th and it's politely rejected until a
-slot frees up. Stale logs older than 24h get swept on session start, so `/tmp` never
-turns into a junk drawer.
+slot frees up. The registry is purely in-memory: a session shutdown — any shutdown,
+not just quit — kills every running task, and nothing is revived into the next
+session. Log files in `/tmp/pi-bg` are simply left for the OS to clean.
+
+Under the hood, all three task kinds (shell, agent, monitor) live in one unified
+in-memory registry and share a single notification engine. Spawning listens for the
+child's `exit` event rather than `close`, so a daemonized grandchild that inherits
+the output descriptors can't hang a job past its real end. Each finished task sends
+its own `<task-notification>` exactly once — reading a finished job's output with
+`jobs output`/`attach` marks it read and suppresses the pending ping, and
+completed-but-unread jobs show `, unread` in `jobs list` and the sidebar.
 
 ## Cooperative Steering (Claude Code parity)
 
@@ -209,6 +208,22 @@ That's exactly how Claude Code behaves: submitting input during an interruptible
 A live pill widget keeps your running jobs in view — each with its duration and a preview of the command. Completed and failed counts ride along in the status line. When you want the full picture, Shift+Down or `/bg-list` opens the task manager.
 
 ## Releases
+
+### 2.0.0 — Claude Code parity re-architecture
+
+The background engine was rebuilt end to end to match Claude Code's actual implementation.
+
+**Breaking changes**
+- **`job_decide` is gone.** On the auto-background timeout the command silently slides into the background — the tool result itself (`Command running in background with ID: …`) is the notification. No decision prompt, no forced turn.
+- **Task IDs changed format.** Sequential `job-<pid>-<n>` is replaced by typed random IDs: `b…` (shell), `m…` (monitor), `a…` (agent) plus 8 base36 chars (e.g. `b7f3k9a2x1`).
+- **No cross-session revival.** Background tasks don't survive a session restart/reload — any session shutdown kills all running tasks. The registry is purely in-memory; `/tmp/pi-bg/*.log` files are left for the OS to clean (the 24h stale-log sweep is gone too).
+- **Completion notifications are individual `<task-notification>` messages** delivered mid-turn (pi's steer mode) — the agent reacts between tool calls. The turn-boundary coalesced summary and the idle coalescing window are gone.
+
+**Engine**
+- Exactly-once delivery via a `notified` latch (CC's `markTaskNotified`): reading a finished job with `jobs output`/`attach` suppresses its pending notification; completed-but-unread jobs show `, unread` in `jobs list` and the sidebar; notified terminal jobs leave the live list (recent ones stay in a recent-terminal ring).
+- One unified in-memory registry for shell/monitor/agent kinds (`jobs list` lines carry a `[shell|agent|monitor]` tag), a single notification engine (`src/notify.ts`), and spawn now uses the `exit` event so daemonized grandchildren can't hang a job.
+- Ctrl+Shift+B (and `/bg`) now background ALL running foreground commands, not just the most recent one.
+- CC-exact user-facing strings throughout (manual background, `jobs kill`, unknown-id errors, completion summaries, stall warnings); timeout kills log `Command timed out after Ns` so the model can tell a timeout kill from a failure.
 
 ### 1.1.6 — Silent timeout backgrounding (CC parity)
 
@@ -236,7 +251,11 @@ A completion notice would fire even after the agent had already learned the job'
 
 - **Live progress in the sidebar.** A running job's pill now shows its **latest output line** (refreshed every second), not just the command — so a long poll/build shows progress at a glance (`◉ qdrant: {"indexed":8540629,"status":"grey"} (2m10s)`). ANSI/control sequences are stripped so the widget stays clean and can't be escape-injected.
 - **No more lingering `sleep` jobs.** A naive `sleep N` wait (even embedded — `cd x; sleep 600; check`, newline-separated, or backgrounded) is now blocked in both `bash` and `bash_bg`, with steering to the tool that ends when the work does: `jobs attach`, the `monitor` tool, or an `until` loop. Sleeps inside real polling loops are never flagged.
-- **Claude Code parity on cancel (verified against CC source).** Pressing **Esc** kills the running foreground command (a deliberate cancel), while typing a new message, **Ctrl+B**, or the auto-background timeout move it to the background instead — exactly CC's `user-cancel` vs `interrupt` behavior. Long work is protected by auto-backgrounding at the timeout + `run_in_background`, not by ignoring a cancel.
+- **Claude Code parity on cancel (verified against CC source).** Pressing **Esc** kills the running foreground command (a deliberate cancel), while typing a new message, **Ctrl+Shift+B**, or the auto-background timeout move it to the background instead — exactly CC's `user-cancel` vs `interrupt` behavior. Long work is protected by auto-backgrounding at the timeout + `run_in_background`, not by ignoring a cancel.
+
+### 1.1.7 — Ctrl+Shift+B (pi reserved-keybinding fix)
+
+- **Background shortcut moved from Ctrl+B to Ctrl+Shift+B.** Recent pi versions reserve `ctrl+b` for the built-in editor cursor-left (`tui.editor.cursorLeft`) and print a startup "extension shortcut conflict" diagnostic when an extension claims it. Registering it also silently broke cursor-left in pi's editor. Everything else is unchanged: the live hint now reads `(ctrl+shift+b to run in background)`, and `/bg` still works everywhere (use it in tmux without extended-keys).
 
 ### 1.1.0 — Monitor tool & coalesced completions
 
@@ -270,7 +289,6 @@ The big one. The background engine was rewritten from the ground up to match Cla
 **Fixes & internals (post-rewrite hardening)**
 - Cooperative steering no longer kills the very command it just backgrounded.
 - Spawn failures (`ENOENT`/`EMFILE`/`EAGAIN`) are handled gracefully instead of crashing the agent.
-- Session restore only revives jobs from the current process — it never signals a possibly-recycled PID.
 - The four spawn paths were consolidated onto a single `startBackgroundJob` service function; foreground teardown moved into `finally` so no exit path can strand a job.
 - Log search runs concurrently across jobs, and the stale-log sweep is bounded and async.
 

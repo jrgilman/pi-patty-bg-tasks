@@ -1,23 +1,21 @@
 /**
- * Unit tests for spawn.ts re-exports and lifecycle.ts.
+ * Unit tests for spawn.ts process primitives and lifecycle.ts.
  */
 
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { killProcessTree, processExists } from "../proc.ts";
+import { killProcessTree, processExists } from "../spawn.ts";
 import {
     abortJob,
     backgroundActiveForeground,
     createJobAbort,
     ensureCompletionPromise,
-    isSignalExit,
     markKilledSilently,
     markTerminal,
-    requestJobDecision,
     statusFromExit,
 } from "../lifecycle.ts";
 import { BackgroundRegistry } from "../state.ts";
-import { EVENT, type Job, type UiContext } from "../types.ts";
+import { type Job, type UiContext } from "../types.ts";
 
 void describe("processExists", () => {
     void it("the current process is alive", () => {
@@ -51,29 +49,18 @@ void describe("statusFromExit", () => {
     void it("1 → failed", () => {
         assert.equal(statusFromExit(1), "failed");
     });
-    void it("null → completed (treated as signal exit)", () => {
-        assert.equal(statusFromExit(null), "completed");
+    void it("a signal death → killed (external kill, OOM — never completed)", () => {
+        assert.equal(statusFromExit(null, "SIGKILL"), "killed");
+        assert.equal(statusFromExit(null, "SIGTERM"), "killed");
+    });
+    void it("a signal wins over a code", () => {
+        assert.equal(statusFromExit(0, "SIGKILL"), "killed");
+    });
+    void it("null without a signal → failed (the spawn-error path passes code 1)", () => {
+        assert.equal(statusFromExit(null), "failed");
     });
     void it("undefined → failed", () => {
         assert.equal(statusFromExit(undefined), "failed");
-    });
-});
-
-void describe("isSignalExit", () => {
-    void it("137 = SIGKILL", () => {
-        assert.equal(isSignalExit(137), true);
-    });
-    void it("143 = SIGTERM", () => {
-        assert.equal(isSignalExit(143), true);
-    });
-    void it("0 is not a signal exit", () => {
-        assert.equal(isSignalExit(0), false);
-    });
-    void it("null is not a signal exit (treated as spawn error)", () => {
-        assert.equal(isSignalExit(null), false);
-    });
-    void it("undefined is not a signal exit", () => {
-        assert.equal(isSignalExit(undefined), false);
     });
 });
 
@@ -123,11 +110,11 @@ void describe("ensureCompletionPromise", () => {
 });
 
 void describe("markKilledSilently", () => {
-    void it("status=killed, outputConsumed=true", () => {
+    void it("status=killed, notified=true", () => {
         const job = makeJob();
         markKilledSilently(job);
         assert.equal(job.status, "killed");
-        assert.equal(job.outputConsumed, true);
+        assert.equal(job.notified, true);
     });
 });
 
@@ -165,62 +152,26 @@ void describe("BackgroundRegistry defaults", () => {
         assert.ok(reg.jobs instanceof Map);
         assert.ok(reg.foreground instanceof Map);
         assert.ok(reg.jobAborts instanceof Map);
-        assert.equal(reg.counter, 0);
-        assert.equal(reg.activeToolCallId, null);
         assert.equal(reg.totalStarted, 0);
     });
 });
 
 void describe("backgroundActiveForeground", () => {
-    void it("manual background sends bg-manual without creating a timeout decision", () => {
+    void it("manual background pauses the slot and toasts — no synthetic agent message", () => {
         const reg = new BackgroundRegistry();
-        const sent: { customType?: string }[] = [];
         const notifications: string[] = [];
         let pauseReason: string | undefined;
-        reg.activeToolCallId = "tc-manual";
         reg.foreground.set("tc-manual", {
             requestPause: (reason) => {
                 pauseReason = reason;
             },
         });
 
-        const ok = backgroundActiveForeground(
-            reg,
-            { sendMessage: (msg: { customType?: string }) => sent.push(msg) } as never,
-            makeCtx(notifications)
-        );
+        const ok = backgroundActiveForeground(reg, makeCtx(notifications));
 
         assert.equal(ok, true);
         assert.equal(pauseReason, "manual");
-        assert.equal(reg.pendingDecisionJobId, undefined);
-        assert.equal(sent[0]?.customType, EVENT.background);
         assert.equal(notifications[0], "▶ Backgrounded — continuing.");
-    });
-});
-
-void describe("requestJobDecision", () => {
-    void it("timeout background records pending decision and shows only a toast (no forced turn — CC parity)", () => {
-        const reg = new BackgroundRegistry();
-        const sent: { customType?: string }[] = [];
-        const toasts: string[] = [];
-        const job = makeJob({ id: "job-timeout", command: "pnpm test" });
-
-        requestJobDecision({
-            reg,
-            pi: { sendMessage: (msg: { customType?: string }) => sent.push(msg) } as never,
-            ctx: { ui: { notify: (m: string) => toasts.push(m) } } as never,
-            job,
-            timeoutMs: 15_000,
-        });
-
-        assert.equal(reg.pendingDecisionJobId, "job-timeout");
-        // Claude Code just backgrounds on timeout — no steering message, no
-        // forced turn. The bash tool's own result tells the agent; only a
-        // human-facing toast fires here.
-        assert.equal(sent.length, 0, "no sendMessage on timeout (CC parity)");
-        assert.equal(toasts.length, 1);
-        assert.match(toasts[0], /Backgrounded/);
-        assert.match(toasts[0], /still running/);
     });
 });
 

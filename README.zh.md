@@ -16,7 +16,7 @@
   <img alt="license: MIT" src="https://img.shields.io/badge/license-MIT-blue">
 </p>
 
-**构建还在跑,代理不该干等着。** 这就是 Claude Code 的后台任务体验,如今搬到了 Pi 上:扔出一条长命令,它不会卡住整个会话,而是悄悄溜到后台,代理则继续埋头干活。120 秒自动转后台、Ctrl+B 一键秒转、输出全程捕获、卡顿自动检测,外加一个功能齐全的作业管理器 —— 全都打包进一个扩展里。
+**构建还在跑,代理不该干等着。** 这就是 Claude Code 的后台任务体验,如今搬到了 Pi 上:扔出一条长命令,它不会卡住整个会话,而是悄悄溜到后台,代理则继续埋头干活。120 秒自动转后台、Ctrl+Shift+B 一键秒转、输出全程捕获、卡顿自动检测,外加一个功能齐全的作业管理器 —— 全都打包进一个扩展里。
 
 ## 安装
 
@@ -36,7 +36,7 @@ pi install git:github.com/patty-io/pi-patty-bg-tasks
 
 **会话卡死,到此为止。** 开发服务器、测试套件、构建 —— 任何跑过 120 秒还没完事的命令,都会被悄悄挪到后台。代理收到提醒,转头就去干下一件事,而不是盯着转圈圈的进度条发呆。想让它早点滚到后台?随时手动一推就行。
 
-**用起来像 Claude Code,因为它就是照着 Claude Code 做的。** 前后台来回切换的这一整套动作 —— Ctrl+B 转后台、输出捕获、完成提醒、卡顿检测 —— 全都直接建在 Claude Code 的实现之上。一样的消息格式,一样的终端原生图标,一样「代理永不停手」的节奏。要是你早已练出肌肉记忆,那这里照样能用。
+**用起来像 Claude Code,因为它就是照着 Claude Code 做的。** 前后台来回切换的这一整套动作 —— Ctrl+Shift+B 转后台、输出捕获、完成提醒、卡顿检测 —— 全都直接建在 Claude Code 的实现之上。一样的消息格式,一样的终端原生图标,一样「代理永不停手」的节奏。要是你早已练出肌肉记忆,那这里照样能用。
 
 **一个像样的作业管理器,而不是临时凑数。** `/bg-list` 打开一个交互式作业管理器:列出作业、瞄一眼输出、干掉跑飞的、或者挂上去等结果,样样都行。
 
@@ -62,13 +62,13 @@ jobs({ action: "search", pattern: "error|warning" })
 agent_bg({ prompt: "重构 auth 模块" })
 ```
 
-命令在跑的时候,随手按下 **Ctrl+B**,它就地转入后台 —— 命令跑过几秒后,输入框下方会浮现一行淡淡的 `(ctrl+b to run in background)` 提示。代理收到通知,你手还没从键盘上松开,它已经回去接着干了。
+命令在跑的时候,随手按下 **Ctrl+Shift+B**,它就地转入后台 —— 命令跑过几秒后,输入框下方会浮现一行淡淡的 `(ctrl+shift+b to run in background)` 提示。代理收到通知,你手还没从键盘上松开,它已经回去接着干了。
 
 ## 工具
 
 ### bash(覆盖)
 
-内置的 bash 工具,但多了点求生本能。命令照常运行 —— 可一旦某条冲破 120 秒,它就自动转入后台,并通过 `job_decide` 问代理下一步怎么办:留着、杀掉,还是先看看输出。
+内置的 bash 工具,但多了点求生本能。命令照常运行 —— 可一旦某条冲破 120 秒,它就悄悄滑进后台。没有决策提示,也不强制开新轮:工具结果本身(`Command running in background with ID: …`)就告诉代理输出去了哪里。
 
 | 参数 | 说明 |
 |------|------|
@@ -84,7 +84,7 @@ agent_bg({ prompt: "重构 auth 模块" })
 |------|------|
 | `command` | 要运行的 shell 命令 |
 | `name` | 可选的可读作业标签 |
-| `timeout` | 可选超时(秒);触发同一套自动后台决策流程 |
+| `timeout` | 可选超时(秒);超时只杀掉无法自动转后台的命令(如 `sleep`),其余照跑不误 |
 | `notify` | 发送完成通知(默认:true) |
 
 ### jobs
@@ -100,15 +100,6 @@ agent_bg({ prompt: "重构 auth 模块" })
 | `search` | 在所有作业日志里做正则搜索 |
 | `cleanup` | 清除已完成/失败的作业,回收磁盘空间 |
 | `stats` | 聚合指标:总启动数、运行中、已完成、失败、平均时长 |
-
-### job_decide
-
-代理对自动转后台命令的回应。120 秒计时器一响,这条提示就送到代理面前。
-
-| 参数 | 说明 |
-|------|------|
-| `jobId` | 后台作业的 ID |
-| `decision` | `keep`(继续跑)、`kill`(终止)或 `check`(先看输出) |
 
 ### agent_bg
 
@@ -152,8 +143,7 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 
 | 快捷键 | 操作 |
 |-------|------|
-| **Ctrl+B** | 把正在运行的前台命令转后台 —— 代理继续干活(对应 Claude Code)。在 tmux 里要按两下(tmux 占用了 Ctrl+B)。 |
-| **Ctrl+Shift+B** | 等同 Ctrl+B(别名) |
+| **Ctrl+Shift+B** | 把所有正在运行的前台命令转后台 —— 代理继续干活(对应 Claude Code 的 Ctrl+B;pi 自己把 Ctrl+B 保留为编辑器光标左移)。在没有 extended-keys 的 tmux 里请改用 `/bg`。 |
 | **Ctrl+Shift+J** | 打开后台作业管理器 |
 | **Shift+Down** | 打开后台作业管理器 |
 | **Ctrl+Shift+X** | 终止最近一个运行中的作业 |
@@ -164,7 +154,7 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 
 | 命令 | 说明 |
 |------|------|
-| `/bg` | 把当前进程转后台(等同 Ctrl+B) |
+| `/bg` | 把当前进程转后台(等同 Ctrl+Shift+B) |
 | `/bg-list` | 打开交互式后台作业管理器 |
 | `/bg-version` | 显示已加载扩展的版本/路径,方便排查重载问题 |
 
@@ -175,20 +165,28 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 ```
 命令启动(直接 Node.js child_process.spawn)
   → 2 秒内完成?          立即返回结果
-  → 120 秒还在跑?        自动转后台 → 代理收到 job_decide 提示
-  → 你按了 Ctrl+B?        立即转后台 → 代理继续
+  → 120 秒还在跑?        自动转后台 → 工具结果带上新的任务 ID
+  → 你按了 Ctrl+Shift+B?   立即转后台 → 代理继续
 
 后台作业运行中
   → 输出经由文件描述符捕获到 /tmp/pi-bg/<id>.log
-  → 卡顿检测:输出看起来像交互式提示时,警告代理
+  → 卡顿检测:输出停摆且尾部看起来像交互式提示时,警告代理
   → 超量检测:输出冲破上限时,直接终止作业
-  → 完成时:代理收到通知,附带状态 + 输出路径
+  → 完成时:独立的 <task-notification> 在轮次中途送达,附带状态 + 输出路径
 ```
 
 后台作业以分离的 Node.js 子进程运行,stdout/stderr 直接接到一个日志文件描述符上 ——
 跟 Claude Code 的做法分毫不差。没有 tmux,没有外部进程管理器,你的命令和它的日志
 之间什么都不隔。最多 **16 个**后台作业同时跑;想塞第 17 个?会被客气地挡回去,直到
-腾出空位。超过 24 小时的旧日志会在会话启动时清扫干净,免得 `/tmp` 沦为杂物堆。
+腾出空位。注册表纯粹在内存里:会话关闭 —— 任何原因的关闭,不只是退出 —— 都会杀掉
+所有运行中的任务,下一个会话不会复活任何东西。`/tmp/pi-bg` 里的日志文件就留给操作系统
+自己清理。
+
+在底层,三种任务类型(shell、agent、monitor)共用一个统一的内存注册表和同一个通知引擎。
+子进程监听 `exit` 事件而非 `close`,因此继承了输出描述符的守护化孙进程无法拖着作业不放。
+每个结束的任务都恰好发送一次自己的 `<task-notification>` —— 用 `jobs output`/`attach`
+读过已结束作业的输出即标记为已读、抑制待发的提醒;已完成但未读的作业在 `jobs list` 和
+侧边栏中显示 `, unread`。
 
 ## 协作式转向(对齐 Claude Code)
 
@@ -208,6 +206,22 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 
 ## 版本发布
 
+### 2.0.0 —— Claude Code 对齐重构
+
+后台引擎从头到尾照着 Claude Code 的真实实现重建了一遍。
+
+**重大变更**
+- **`job_decide` 没了。** 自动转后台超时触发时,命令悄悄滑进后台 —— 工具结果本身(`Command running in background with ID: …`)就是通知。没有决策提示,也不强制开新轮。
+- **任务 ID 格式变了。** 顺序号 `job-<pid>-<n>` 换成带类型的随机 ID:`b…`(shell)、`m…`(monitor)、`a…`(agent)加 8 位 base36 字符(如 `b7f3k9a2x1`)。
+- **不再跨会话复活。** 后台任务撑不过会话重启/重载 —— 任何原因的会话关闭都会杀掉所有运行中的任务。注册表纯粹在内存里;`/tmp/pi-bg/*.log` 日志文件留给操作系统自己清理(24 小时旧日志清扫也一并移除)。
+- **完成通知改为独立的 `<task-notification>` 消息**,在轮次中途送达(pi 的 steer 模式)—— 代理在工具调用之间就能作出反应。回合边界的合并汇总和空闲合并窗口都没了。
+
+**引擎**
+- 靠 `notified` 闩锁(CC 的 `markTaskNotified`)保证恰好一次:用 `jobs output`/`attach` 读过已结束作业的输出,就会抑制其待发的通知;已完成但未读的作业在 `jobs list` 和侧边栏显示 `, unread`;已通知的终止作业从实时列表移除(近期的仍留在 recent-terminal 环里)。
+- shell/monitor/agent 三种类型统一进一个内存注册表(`jobs list` 每行带 `[shell|agent|monitor]` 标签),单一通知引擎(`src/notify.ts`),spawn 改用 `exit` 事件,守护化孙进程再也拖不住作业。
+- Ctrl+Shift+B(及 `/bg`)现在把**所有**正在运行的前台命令转后台,而不只是最近那条。
+- 面向用户的字符串全部对齐 CC(手动转后台、`jobs kill`、未知 ID 报错、完成摘要、卡顿警告);超时强杀会在日志里留下 `Command timed out after Ns`,让模型能把超时和失败区分开。
+
 ### 1.1.2 —— 一条汇总,而非一墙通知
 
 - **后台通知在回合边界合并。** 在一次长回合中完成的作业和监视器,不再在回合回复后堆出一墙 `[job-finished]` / `[bg-monitor-event]`。它们会先累积,在回合结束(`agent_end`)时合并为**一条汇总**——*"4 background events — 1 completed (job-19), 1 failed (job-30 exit 1); 2 monitors ended (API health, port 4000)."* 代理空闲时则用一个短窗口合并。监视器的*流*事件(你正在盯的匹配行)保持实时。
@@ -217,7 +231,11 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 
 - **侧边栏实时进度。** 运行中作业的标签现在显示其**最新输出行**(每秒刷新),而不只是命令——长轮询/构建的进度一目了然(`◉ qdrant: {"indexed":8540629,"status":"grey"} (2m10s)`)。ANSI/控制序列会被剥离,保持组件整洁且无法被转义注入。
 - **不再有滞留的 `sleep` 作业。** 朴素的 `sleep N` 等待(即使是嵌入式的——`cd x; sleep 600; check`、换行分隔、或后台运行)现在在 `bash` 与 `bash_bg` 两侧都会被拦截,并引导到会随工作一起结束的工具:`jobs attach`、`monitor` 工具,或会在就绪时退出的 `until` 循环。真正轮询循环内部的 sleep 绝不会被误拦。
-- **取消行为对齐 Claude Code(已对照 CC 源码验证)。** 按 **Esc** 会杀掉正在运行的前台命令(一次有意的取消),而输入新消息、**Ctrl+B** 或自动后台超时则改为把它移到后台——正是 CC 的 `user-cancel` 与 `interrupt` 之分。长任务靠超时自动后台 + `run_in_background` 来保护,而不是忽略取消。
+- **取消行为对齐 Claude Code(已对照 CC 源码验证)。** 按 **Esc** 会杀掉正在运行的前台命令(一次有意的取消),而输入新消息、**Ctrl+Shift+B** 或自动后台超时则改为把它移到后台——正是 CC 的 `user-cancel` 与 `interrupt` 之分。长任务靠超时自动后台 + `run_in_background` 来保护,而不是忽略取消。
+
+### 1.1.7 —— Ctrl+Shift+B(pi 保留键位修复)
+
+- **后台快捷键从 Ctrl+B 改为 Ctrl+Shift+B。** 新版 pi 把 `ctrl+b` 保留为编辑器内置的光标左移(`tui.editor.cursorLeft`),扩展占用该键时会在启动时打印 “extension shortcut conflict” 诊断,并且会让 pi 编辑器里的光标左移悄悄失效。其余不变:实时提示改为 `(ctrl+shift+b to run in background)`,`/bg` 在任何环境下可用(在没有 extended-keys 的 tmux 里请用 `/bg`)。
 
 ### 1.1.0 —— monitor 工具 & 合并完成通知
 
@@ -251,7 +269,6 @@ monitor({ ws: { url: "wss://events.example.com/stream" }, description: "部署�
 **修复与内部改进(重写后强化)**
 - 协作式转向不再杀掉它刚刚转入后台的那条命令。
 - 生成失败(`ENOENT`/`EMFILE`/`EAGAIN`)会被妥善处理,而不是把代理拖崩。
-- 会话恢复只复活当前进程的作业 —— 绝不向可能已被回收的 PID 发信号。
 - 四条生成路径统一收拢进单个 `startBackgroundJob` 服务函数;前台清理移进 `finally`,任何退出路径都不会遗留作业。
 - 日志搜索在各作业间并发执行,旧日志清扫也改成了有界异步。
 

@@ -7,16 +7,18 @@
  */
 
 import { openSync, readSync, closeSync, statSync as fsStatSync } from "node:fs";
-import { setTimeout as nodeSetTimeout } from "node:timers";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
     DELIVER_FOLLOWUP,
+    DELIVER_STEER,
     EVENT,
     MAX_LOG_BYTES,
     STALL_CHECK_INTERVAL_MS,
     STALL_TAIL_BYTES,
     STALL_THRESHOLD_MS,
 } from "./types.ts";
+import { buildTaskNotification } from "./notify.ts";
+import { describeJob } from "./format.ts";
 
 // --- Stall watcher -------------------------------------------------------
 
@@ -31,6 +33,8 @@ import {
 export function watchStalls(args: {
     jobId: string;
     command: string;
+    /** Job name (bash/bash_bg `description`); falls back to the command. */
+    name?: string;
     logPath: string;
     pi: ExtensionAPI;
     onOversize?: () => void;
@@ -44,7 +48,7 @@ export function watchStalls(args: {
     let lastPromptCheckSize = -1;
     let cancelled = false;
 
-    const timer = nodeSetTimeout(function tick() {
+    const tick = () => {
         if (cancelled) return;
         try {
             const { size } = fsStatSync(args.logPath);
@@ -85,7 +89,7 @@ export function watchStalls(args: {
                     const tail = buf.toString("utf-8", 0, toRead);
                     if (looksLikePrompt(tail)) {
                         cancelled = true;
-                        sendStallPrompt(args.pi, args.jobId, args.command, args.logPath, tail);
+                        sendStallPrompt(args.pi, args.jobId, describeJob(args.name, args.command), args.logPath, tail);
                         return;
                     }
                 } finally {
@@ -95,9 +99,17 @@ export function watchStalls(args: {
         } catch {
             /* File may not exist yet — retry next tick. */
         }
-        timer.refresh();
-    }, STALL_CHECK_INTERVAL_MS);
-    timer.unref();
+        schedule();
+    };
+    // Re-arm with a fresh timer each tick (rather than refresh()) so the
+    // watcher also works under node:test mock timers. Global setTimeout —
+    // a node:timers named import is snapshotted before mock.timers.enable.
+    let timer: NodeJS.Timeout;
+    const schedule = () => {
+        timer = setTimeout(tick, STALL_CHECK_INTERVAL_MS);
+        timer.unref();
+    };
+    schedule();
 
     return () => {
         cancelled = true;
@@ -124,27 +136,35 @@ export function looksLikePrompt(tail: string): boolean {
     return PROMPT_PATTERNS.some((p) => p.test(lastLine));
 }
 
+/**
+ * Send the interactive-prompt stall warning: Claude Code's <task-notification>
+ * shape WITHOUT a <status> tag (CC omits it deliberately — the job is still
+ * running), followed by the output tail and remediation guidance as plain
+ * text, all as ONE message content. Delivered like a completion (steer +
+ * triggerTurn). Does NOT touch the job's `notified` latch — a later real
+ * completion must still notify.
+ */
 function sendStallPrompt(
     pi: ExtensionAPI,
     jobId: string,
-    command: string,
+    description: string,
     logPath: string,
     tail: string
 ): void {
-    const summary =
-        `Background job ${jobId} appears to be waiting for interactive input.\n` +
-        `Command: ${command}\n\n` +
-        `Last output:\n${tail.trimEnd()}\n\n` +
-        `The command is likely blocked on an interactive prompt. Kill this job and re-run ` +
-        `with piped input (e.g., \`echo y | command\`) or a non-interactive flag.`;
+    const summary = `Background command "${description}" appears to be waiting for interactive input`;
+    const content =
+        buildTaskNotification({ taskId: jobId, outputFile: logPath, summary }) +
+        `\nLast output:\n${tail.trimEnd()}\n\n` +
+        `The command is likely blocked on an interactive prompt. Kill this task and re-run ` +
+        `with piped input (e.g., \`echo y | command\`) or a non-interactive flag if one exists.`;
 
     pi.sendMessage(
         {
-            customType: EVENT.stall,
-            content: `⚠️ ${summary}`,
+            customType: EVENT.taskNotification,
+            content,
             display: true,
-            details: { jobId, logPath, command },
+            details: { jobId, logPath, summary },
         },
-        DELIVER_FOLLOWUP
+        DELIVER_STEER
     );
 }

@@ -14,7 +14,7 @@ import {
     MONITOR_MAX_TIMEOUT_MS,
     type UiContext,
 } from "../types.ts";
-import { add, createRunningJob, errPathFor, nextJobId, logPathFor } from "../registry.ts";
+import { add, createRunningJob, errPathFor, newJobId, logPathFor } from "../registry.ts";
 import { assertJobSlot, isBlankCommand, requireExistingCwd } from "../lifecycle.ts";
 import { isWsSupported, type WsSpec } from "../monitor-ws.ts";
 import {
@@ -110,7 +110,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
                 MONITOR_MAX_TIMEOUT_MS
             );
 
-            const id = nextJobId(reg);
+            const id = newJobId("monitor", reg);
             const logPath = logPathFor(id);
 
             // Build the event source (command or ws) behind one seam, then hand
@@ -126,6 +126,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
 
             const job = createRunningJob({
                 id,
+                name: description,
                 command: source.label,
                 pid: source.pid,
                 logPath,

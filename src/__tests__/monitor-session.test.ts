@@ -7,8 +7,8 @@ import { BackgroundRegistry } from "../state.ts";
 import { add, createRunningJob } from "../registry.ts";
 import { startMonitorSession } from "../monitor-session.ts";
 import type { MonitorSource } from "../monitor-source.ts";
-import { flushTurnBoundaryNotices } from "../notify.ts";
-import { EVENT, type Job, type UiContext } from "../types.ts";
+import type { SpawnExit } from "../spawn.ts";
+import { EVENT, type UiContext } from "../types.ts";
 
 const dir = join(tmpdir(), `pi-bg-session-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -28,8 +28,8 @@ function harness(logPath: string) {
     } as unknown as UiContext;
     const reg = new BackgroundRegistry();
 
-    let resolveExit!: (code: number | null) => void;
-    const exit = new Promise<number | null>((res) => {
+    let resolveExit!: (result: SpawnExit) => void;
+    const exit = new Promise<SpawnExit>((res) => {
         resolveExit = res;
     });
     let stopped = false;
@@ -45,6 +45,7 @@ function harness(logPath: string) {
 
     const job = createRunningJob({
         id: `job-${process.pid}-1`,
+        name: "watch", // production sets name: description (see tools/monitor.ts)
         command: source.label,
         pid: source.pid,
         logPath,
@@ -65,13 +66,12 @@ function harness(logPath: string) {
             timeoutMs: over?.timeoutMs ?? 60_000,
         });
 
-    // The terminal notice is now coalesced (enqueueMonitorEnd → flushTurnBoundaryNotices),
-    // so force the flush, then find it among the captured messages.
-    const flush = () => flushTurnBoundaryNotices(reg, pi as never, ctx);
-    const terminals = () => messages.filter((m) => /◉ watch —/.test(m.content));
+    // The terminal notice is its own <task-notification>, sent the moment the
+    // source ends — no coalescing window, no flush to force.
+    const terminals = () => messages.filter((m) => m.customType === EVENT.taskNotification);
     const allText = () => messages.map((m) => m.content).join("\n");
 
-    return { messages, reg, job, start, resolveExit, isStopped: () => stopped, flush, terminals, allText };
+    return { messages, reg, job, start, resolveExit, isStopped: () => stopped, terminals, allText };
 }
 
 void describe("monitor-session — lifecycle via a fake source", () => {
@@ -82,14 +82,17 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         h.start();
         appendFileSync(logPath, "line-A\nline-B\n");
         await sleep(40);
-        h.resolveExit(0);
+        h.resolveExit({ code: 0, signal: null });
         await sleep(60);
-        h.flush();
 
         assert.match(h.allText(), /line-A/);
         assert.match(h.allText(), /line-B/);
         assert.equal(h.terminals().length, 1);
-        assert.match(h.terminals()[0].content, /stream ended/);
+        const xml = h.terminals()[0].content;
+        assert.ok(xml.includes("<status>completed</status>"));
+        assert.ok(xml.includes(`<summary>Monitor "watch" stream ended</summary>`));
+        // Evicted by completeJob once the notification has fired.
+        assert.equal(h.reg.jobs.has(h.job.id), false);
     });
 
     void it("maps a non-zero exit to a failure terminal", async () => {
@@ -97,23 +100,23 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         writeFileSync(logPath, "");
         const h = harness(logPath);
         h.start();
-        h.resolveExit(1);
+        h.resolveExit({ code: 1, signal: null });
         await sleep(60);
-        h.flush();
         assert.equal(h.terminals().length, 1);
-        assert.match(h.terminals()[0].content, /script failed \(exit 1\)/);
+        assert.ok(h.terminals()[0].content.includes("<status>failed</status>"));
+        assert.ok(h.terminals()[0].content.includes(`Monitor "watch" script failed (exit 1)`));
     });
 
-    void it("maps a signal exit to a 'stopped' terminal", async () => {
+    void it("maps a signal death to a 'stopped' terminal", async () => {
         const logPath = join(dir, "signal.log");
         writeFileSync(logPath, "");
         const h = harness(logPath);
         h.start();
-        h.resolveExit(143);
+        h.resolveExit({ code: null, signal: "SIGKILL" });
         await sleep(60);
-        h.flush();
         assert.equal(h.terminals().length, 1);
-        assert.match(h.terminals()[0].content, /stopped/);
+        assert.ok(h.terminals()[0].content.includes("<status>killed</status>"));
+        assert.ok(h.terminals()[0].content.includes(`Monitor "watch" stopped`));
     });
 
     void it("trips the firehose guard, tears down the source, and kills the job", async () => {
@@ -123,7 +126,6 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         h.start();
         appendFileSync(logPath, Array.from({ length: 600 }, (_, i) => `e${i}`).join("\n") + "\n");
         await sleep(300); // let a follower tick read the burst
-        h.flush();
 
         assert.equal(h.terminals().length, 1, "exactly one terminal");
         assert.match(h.terminals()[0].content, /too many events/);
@@ -136,11 +138,10 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         writeFileSync(logPath, "");
         const h = harness(logPath);
         h.start();
-        h.resolveExit(0);
+        h.resolveExit({ code: 0, signal: null });
         await sleep(60);
-        h.resolveExit(1); // ignored — promise already settled
+        h.resolveExit({ code: 1, signal: null }); // ignored — promise already settled
         await sleep(40);
-        h.flush();
         assert.equal(h.terminals().length, 1);
     });
 });

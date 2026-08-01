@@ -9,17 +9,14 @@ export function registerInputHandlers(pi: ExtensionAPI, reg: BackgroundRegistry)
         // Cooperative steering (Claude Code parity): ANY input typed while a
         // foreground bash command is running backgrounds that command and
         // re-delivers the input as the next turn — regardless of the message's
-        // steer/followUp streamingBehavior. We only intercept when there is an
-        // active foreground slot; everything else falls through to Pi.
-        if (!reg.activeToolCallId) return { action: "continue" };
-        if (!reg.foreground.has(reg.activeToolCallId)) return { action: "continue" };
+        // steer/followUp streamingBehavior. We only intercept when a foreground
+        // slot is active; everything else falls through to Pi.
+        if (reg.foreground.size === 0) return { action: "continue" };
         // Don't intercept extension-sourced messages.
         if (event.source === "extension") return { action: "continue" };
 
         const text = event.text;
-        const bg = backgroundActiveForeground(reg, pi, ctx as UiContext, {
-            notifyAgent: false,
-        });
+        const bg = backgroundActiveForeground(reg, ctx as UiContext);
         if (!bg) return { action: "continue" };
 
         // Abort the current turn so the bash tool returns the "backgrounded" result.

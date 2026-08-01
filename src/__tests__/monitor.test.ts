@@ -5,11 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BackgroundRegistry } from "../state.ts";
 import { registerMonitorTool } from "../tools/monitor.ts";
-import { reviveAndValidate } from "../lifecycle.ts";
 import { spawnWithFileOutput } from "../spawn.ts";
 import { openWsSource, isWsSupported } from "../monitor-ws.ts";
-import { flushTurnBoundaryNotices } from "../notify.ts";
-import { EVENT, type Job } from "../types.ts";
+import { EVENT } from "../types.ts";
 
 const dir = join(tmpdir(), `pi-bg-monitor-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -84,8 +82,8 @@ void describe("monitor tool — validation", () => {
 });
 
 void describe("monitor tool — command lifecycle", () => {
-    void it("streams lines live, and coalesces the terminal into one notice", async () => {
-        const { tool, ctx, messages, reg, pi } = makeHarness();
+    void it("streams lines live, and sends one terminal <task-notification>", async () => {
+        const { tool, ctx, messages } = makeHarness();
         const res = await tool.execute(
             "t4",
             { command: "printf 'line-A\\nline-B\\n'", description: "test stream" },
@@ -93,10 +91,9 @@ void describe("monitor tool — command lifecycle", () => {
             undefined,
             ctx
         );
-        assert.match(res.content[0].text, /Monitor job-.* started/);
+        assert.match(res.content[0].text, /Monitor m[0-9a-z]{8} started/);
 
-        await sleep(300); // let the source exit + terminal enqueue
-        flushTurnBoundaryNotices(reg, pi as never, ctx as never); // force the coalesced flush
+        await sleep(300); // let the source exit + terminal notify
 
         // Stream lines are delivered live as monitor events.
         const monitorEvents = messages.filter((m) => m.customType === EVENT.monitorEvent);
@@ -107,13 +104,12 @@ void describe("monitor tool — command lifecycle", () => {
         assert.match(streamText, /line-A/);
         assert.match(streamText, /line-B/);
 
-        // The terminal notice is now coalesced into exactly one jobFinished.
-        const terminals = messages.filter((m) => m.customType === EVENT.jobFinished);
-        assert.equal(terminals.length, 1, "exactly one coalesced terminal notice");
-        assert.match(
-            (terminals[0] as unknown as { content: string }).content,
-            /test stream — stream ended/
-        );
+        // The terminal notice is its own task-notification, sent at exit.
+        const terminals = messages.filter((m) => m.customType === EVENT.taskNotification);
+        assert.equal(terminals.length, 1, "exactly one terminal notification");
+        const content = (terminals[0] as unknown as { content: string }).content;
+        assert.ok(content.includes("<status>completed</status>"));
+        assert.ok(content.includes(`<summary>Monitor "test stream" stream ended</summary>`));
     });
 });
 
@@ -131,43 +127,6 @@ void describe("monitor — split spawn output", () => {
         assert.match(readFileSync(logPath, "utf-8"), /OUT/);
         assert.doesNotMatch(readFileSync(logPath, "utf-8"), /ERR/);
         assert.match(readFileSync(errPath, "utf-8"), /ERR/);
-    });
-});
-
-void describe("monitor — revival", () => {
-    void it("marks a persisted monitor terminal instead of reviving it", () => {
-        const job = {
-            id: `job-${process.pid}-9`,
-            command: "ws wss://x",
-            pid: 0,
-            startTime: Date.now(),
-            status: "running",
-            logPath: join(dir, "x.log"),
-            toolCallId: "t",
-            isBackgrounded: true,
-            kind: "monitor",
-        } as Job;
-        const verdict = reviveAndValidate(new BackgroundRegistry(), job);
-        assert.equal(verdict, "completed");
-        assert.equal(job.status, "failed");
-    });
-
-    void it("keeps a still-alive command monitor running (not orphaned)", () => {
-        // pid = this process (alive), id encodes this process → same-session reload.
-        const job = {
-            id: `job-${process.pid}-10`,
-            command: "tail -f app.log",
-            pid: process.pid,
-            startTime: Date.now(),
-            status: "running",
-            logPath: join(dir, "cmd.log"),
-            toolCallId: "t",
-            isBackgrounded: true,
-            kind: "monitor",
-        } as Job;
-        const verdict = reviveAndValidate(new BackgroundRegistry(), job);
-        assert.equal(verdict, "alive");
-        assert.equal(job.status, "running");
     });
 });
 
