@@ -9,6 +9,7 @@
 import { describe, it, after } from "node:test";
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import extension from "../index.ts";
 import { EVENT } from "../types.ts";
 
@@ -43,11 +44,23 @@ interface CapturedTool {
     ) => Promise<{ content: { type: "text"; text: string }[] }>;
 }
 
+interface CapturedComponent {
+    render(width: number): string[];
+    invalidate(): void;
+}
+
+type MessageRenderer = (
+    message: { content: unknown; details?: unknown },
+    options: unknown,
+    theme: { fg(colour: string, text: string): string }
+) => CapturedComponent;
+
 type SessionHandler = (event: { reason?: string }, ctx: unknown) => Promise<void>;
 
 function makePi() {
     const tools = new Map<string, CapturedTool>();
     const handlers = new Map<string, SessionHandler>();
+    const renderers = new Map<string, MessageRenderer>();
     const messages: { customType: string }[] = [];
     const appendedEntries: unknown[] = [];
     const pi = {
@@ -56,7 +69,9 @@ function makePi() {
         },
         registerShortcut() {},
         registerCommand() {},
-        registerMessageRenderer() {},
+        registerMessageRenderer(customType: string, renderer: MessageRenderer) {
+            renderers.set(customType, renderer);
+        },
         on(event: string, handler: SessionHandler) {
             handlers.set(event, handler);
         },
@@ -67,7 +82,7 @@ function makePi() {
             appendedEntries.push(data);
         },
     };
-    return { pi, tools, handlers, messages, appendedEntries };
+    return { pi, tools, handlers, renderers, messages, appendedEntries };
 }
 
 const uiCtx = {
@@ -85,6 +100,31 @@ function startExtension() {
     extension(h.pi as never);
     return h;
 }
+
+void describe("task notification renderer", () => {
+    void it("keeps a long summary within the terminal width", () => {
+        const h = startExtension();
+        const renderer = h.renderers.get(EVENT.taskNotification);
+        assert.ok(renderer);
+
+        const width = 40;
+        const component = renderer(
+            {
+                content: "unused",
+                details: {
+                    status: "completed",
+                    summary: "Monitor with a deliberately long description stream ended",
+                },
+            },
+            {},
+            { fg: (_colour, text) => `\x1b[32m${text}\x1b[39m` }
+        );
+        const [line] = component.render(width);
+        const lineWidth = visibleWidth(line);
+
+        assert.ok(lineWidth <= width, `rendered ${lineWidth} columns for width ${width}`);
+    });
+});
 
 void describe("session_start — registry is born empty (no revival)", () => {
     void it("ignores a stale persisted state entry entirely", async () => {
