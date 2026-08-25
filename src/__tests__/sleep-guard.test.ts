@@ -1,8 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { detectBlockedSleep } from "../lifecycle.ts";
-import { BackgroundRegistry } from "../state.ts";
-import { registerBashBgTool } from "../tools/bash-bg.ts";
 
 void describe("detectBlockedSleep — naive-wait detection", () => {
     void it("blocks a standalone long sleep", () => {
@@ -55,32 +53,5 @@ void describe("detectBlockedSleep — naive-wait detection", () => {
     void it("allows commands with no sleep", () => {
         assert.equal(detectBlockedSleep("npm run build && npm test"), null);
         assert.equal(detectBlockedSleep("echo sleeping; echo done"), null);
-    });
-});
-
-void describe("bash_bg — rejects a backgrounded sleep wait", () => {
-    function bashBg() {
-        let tool: { execute: (id: string, p: unknown, s: unknown, u: unknown, c: unknown) => Promise<unknown> } | undefined;
-        const pi = { registerTool: (def: typeof tool) => { tool = def; }, sendMessage() {} };
-        registerBashBgTool(pi as never, new BackgroundRegistry());
-        const ctx = {
-            cwd: process.cwd(),
-            ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: (_c: string, t: string) => t } },
-        };
-        return { tool: tool!, ctx };
-    }
-
-    void it("blocks an embedded sleep in bash_bg (previously unguarded)", async () => {
-        const { tool, ctx } = bashBg();
-        await assert.rejects(
-            () => tool.execute("t1", { command: "cd /repo; sleep 600; cat log" }, undefined, undefined, ctx),
-            /Blocked: sleep 600.*jobs action='attach'/s
-        );
-    });
-
-    void it("still allows a real backgrounded command", async () => {
-        const { tool, ctx } = bashBg();
-        const res = await tool.execute("t2", { command: "echo hi" }, undefined, undefined, ctx);
-        assert.ok(res, "non-sleep command runs");
     });
 });

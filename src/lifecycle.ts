@@ -37,7 +37,7 @@ export function assertJobSlot(reg: BackgroundRegistry): void {
  * Wire a background job's lifecycle: completion promise, abort controller,
  * stall watcher, and the exit→completeJob hand-off. The job must already be in
  * the registry. Returns the job's AbortController so callers can attach extra
- * monitors (e.g. agent_bg's progress poller).
+ * monitors.
  */
 export function startBackgroundJob(args: {
     reg: BackgroundRegistry;
@@ -87,8 +87,8 @@ export function startBackgroundJob(args: {
 
 /**
  * Standard completion flow after a job exits — abortJob → markTerminal →
- * notify → renderSidebar. Shared by every tool's exit callback (bash,
- * bash_bg, agent_bg, monitor) as the canonical termination protocol.
+ * notify → renderSidebar. Shared by the bash and monitor exit callbacks as
+ * the canonical termination protocol.
  *
  * The notification is Claude Code's per-job <task-notification>, sent the
  * moment the job exits (see notify.ts). A successful send evicts the job
@@ -96,9 +96,7 @@ export function startBackgroundJob(args: {
  * already known (killed silently, or read via jobs output/attach) skip the
  * notification and linger until the lazy sweep in `jobs list`. Monitors own
  * their terminal notification (monitor-session, shouldNotify: false) and are
- * evicted here once it has fired. A `shouldNotify: false` job (bash_bg
- * `notify: false`) is latched notified WITHOUT sending — "don't notify" IS
- * notified — so it evicts too and never lingers as a permanent entry.
+ * evicted here once it has fired.
  */
 export function completeJob(args: {
     job: Job;

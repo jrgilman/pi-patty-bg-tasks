@@ -101,6 +101,15 @@ function startExtension() {
     return h;
 }
 
+void describe("tool registration", () => {
+    void it("omits redundant background tools", () => {
+        const h = startExtension();
+
+        assert.equal(h.tools.has("bash_bg"), false);
+        assert.equal(h.tools.has("agent_bg"), false);
+    });
+});
+
 void describe("task notification renderer", () => {
     void it("keeps a long summary within the terminal width", () => {
         const h = startExtension();
