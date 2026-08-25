@@ -52,8 +52,8 @@ export function statusLabel(job: Job, duration?: string): string {
 }
 
 /** "b7f3k9a2x1 [shell]: ls -la (last 80 chars)" — single line for `jobs list`.
- *  Every line carries the kind tag (shell/agent/monitor) so the unified list
- *  shows what each task is. */
+ *  Every line carries the kind tag (shell/monitor) so the unified list shows
+ *  what each task is. */
 export function formatJobLine(job: Job): string {
     const head = job.name ? `${job.name} (${job.id})` : job.id;
     const kind = job.kind ?? "shell";
@@ -71,8 +71,7 @@ export function truncateTail(content: string, maxChars: number): string {
 }
 
 /** Text content block builder — shared across all tools. The explicit return
- *  type documents the shared contract for the five tool call sites that
- *  import this — they rely on the literal shape, not inference. */
+ *  type documents the shared contract for its tool call sites. */
 export function textBlock(s: string): { type: "text"; text: string } {
     return { type: "text" as const, text: s };
 }

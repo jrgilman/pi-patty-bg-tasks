@@ -66,13 +66,6 @@ export function completionSummary(job: Job, status?: TerminalStatus): string {
         if (s === "failed") return `Monitor "${desc}" script failed (exit ${job.exitCode ?? "unknown"})`;
         return `Monitor "${desc}" stream ended`;
     }
-    if (job.kind === "agent") {
-        if (s === "killed") return `Agent "${desc}" was stopped`;
-        if (s === "failed") {
-            return `Agent "${desc}" failed: ${job.exitCode !== undefined ? `exit code ${job.exitCode}` : "unknown error"}`;
-        }
-        return `Agent "${desc}" completed`;
-    }
     if (s === "killed") return `Background command "${desc}" was stopped`;
     if (s === "failed") return `Background command "${desc}" failed with exit code ${job.exitCode ?? "unknown"}`;
     return `Background command "${desc}" completed${job.exitCode != null ? ` (exit code ${job.exitCode})` : ""}`;

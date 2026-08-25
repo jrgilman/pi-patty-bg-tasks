@@ -1,10 +1,6 @@
 # pi-patty-bg-tasks
 
 <p align="center">
-  <strong>English</strong> · <a href="README.ko.md">한국어</a> · <a href="README.zh.md">中文</a>
-</p>
-
-<p align="center">
   <strong>Long commands shouldn't freeze your agent. Background them automatically — and keep shipping.</strong>
 </p>
 
@@ -49,17 +45,11 @@ bash({ command: "npm run build" })
 # Skip the wait — start it in the background up front
 bash({ command: "npm run dev", run_in_background: true })
 
-# Or fire-and-forget straight to the background
-bash_bg({ command: "npm run dev", name: "devserver" })
-
 # Check on what's running
 jobs({ action: "list" })
 
 # Grep across every job's output at once
 jobs({ action: "search", pattern: "error|warning" })
-
-# Hand off a whole task to a background agent
-agent_bg({ prompt: "Refactor the auth module" })
 ```
 
 Hit **Ctrl+Shift+B** whenever commands are running to background them all on the spot — a dim `(ctrl+shift+b to run in background)` hint appears under your input once a command has been going a couple of seconds. The agent gets notified and is back to work before you've let go of the keys.
@@ -76,17 +66,6 @@ The built-in bash tool, with a survival instinct. Commands run normally — but 
 | `timeout` | Custom timeout in seconds (default: 120) |
 | `run_in_background` | Start the command in the background immediately, skipping the foreground run and the auto-background timer |
 
-### bash_bg
-
-When you already know it's a long one. Starts a command in the background immediately — no foreground race, no timeout to wait out.
-
-| Parameter | Description |
-|-----------|-------------|
-| `command` | Shell command to run |
-| `name` | Optional human-readable label for the job |
-| `timeout` | Optional timeout in seconds; an overrun kills only commands that can't be auto-backgrounded (e.g. `sleep`) — anything else keeps running |
-| `notify` | Send a completion notification (default: true) |
-
 ### jobs
 
 Mission control for everything running in the background: list, read output, kill, attach, search, cleanup, or pull stats.
@@ -101,18 +80,9 @@ Mission control for everything running in the background: list, read output, kil
 | `cleanup` | Purge completed/failed jobs and reclaim disk |
 | `stats` | Aggregate metrics: total started, running, completed, failed, average duration |
 
-### agent_bg
-
-Clone yourself a coworker. Spawns a detached `pi -p` process with a continuity prompt derived from the current session, then streams its progress back to you live.
-
-| Parameter | Description |
-|-----------|-------------|
-| `prompt` | Task description for the background agent |
-| `cwd` | Working directory (default: current) |
-
 ### monitor
 
-Stream events instead of waiting once. Where `bash_bg`/`run_in_background` give a **single** completion ping, `monitor` turns a process into a **live event stream** — each stdout line (or WebSocket frame) becomes one notification delivered straight into the agent's turn while it keeps working. This is the streaming half of Claude Code's split: one-shot "wait until done" stays on `run_in_background`; per-event "tell me each time X happens" is `monitor`. By default stream events are **passive**: they surface on the agent's next turn without starting one. Set `steer: true` when the agent must react on its own (unattended PR or CI watches) — each event is then delivered as a steering notification that starts its own turn even while the agent is idle.
+Stream events instead of waiting once. Where `run_in_background` gives a **single** completion ping, `monitor` turns a process into a **live event stream** — each stdout line (or WebSocket frame) becomes one notification delivered straight into the agent's turn while it keeps working. This is the streaming half of Claude Code's split: one-shot "wait until done" stays on `run_in_background`; per-event "tell me each time X happens" is `monitor`. By default stream events are **passive**: they surface on the agent's next turn without starting one. Set `steer: true` when the agent must react on its own (unattended PR or CI watches) — each event is then delivered as a steering notification that starts its own turn even while the agent is idle.
 
 ```js
 // Notify on every error line, indefinitely
@@ -187,7 +157,7 @@ slot frees up. The registry is purely in-memory: a session shutdown — any shut
 not just quit — kills every running task, and nothing is revived into the next
 session. Log files in `/tmp/pi-bg` are simply left for the OS to clean.
 
-Under the hood, all three task kinds (shell, agent, monitor) live in one unified
+Under the hood, both task kinds (shell and monitor) live in one unified
 in-memory registry and share a single notification engine. Spawning listens for the
 child's `exit` event rather than `close`, so a daemonized grandchild that inherits
 the output descriptors can't hang a job past its real end. Each finished task sends
@@ -219,13 +189,13 @@ The background engine was rebuilt end to end to match Claude Code's actual imple
 
 **Breaking changes**
 - **`job_decide` is gone.** On the auto-background timeout the command silently slides into the background — the tool result itself (`Command running in background with ID: …`) is the notification. No decision prompt, no forced turn.
-- **Task IDs changed format.** Sequential `job-<pid>-<n>` is replaced by typed random IDs: `b…` (shell), `m…` (monitor), `a…` (agent) plus 8 base36 chars (e.g. `b7f3k9a2x1`).
+- **Task IDs changed format.** Sequential `job-<pid>-<n>` is replaced by typed random IDs: `b…` (shell) or `m…` (monitor) plus 8 base36 chars (e.g. `b7f3k9a2x1`).
 - **No cross-session revival.** Background tasks don't survive a session restart/reload — any session shutdown kills all running tasks. The registry is purely in-memory; `/tmp/pi-bg/*.log` files are left for the OS to clean (the 24h stale-log sweep is gone too).
 - **Completion notifications are individual `<task-notification>` messages** delivered mid-turn (pi's steer mode) — the agent reacts between tool calls. The turn-boundary coalesced summary and the idle coalescing window are gone.
 
 **Engine**
 - Exactly-once delivery via a `notified` latch (CC's `markTaskNotified`): reading a finished job with `jobs output`/`attach` suppresses its pending notification; completed-but-unread jobs show `, unread` in `jobs list` and the sidebar; notified terminal jobs leave the live list (recent ones stay in a recent-terminal ring).
-- One unified in-memory registry for shell/monitor/agent kinds (`jobs list` lines carry a `[shell|agent|monitor]` tag), a single notification engine (`src/notify.ts`), and spawn now uses the `exit` event so daemonized grandchildren can't hang a job.
+- One unified in-memory registry for shell and monitor kinds (`jobs list` lines carry a `[shell|monitor]` tag), a single notification engine (`src/notify.ts`), and spawn now uses the `exit` event so daemonized grandchildren cannot hang a job.
 - Ctrl+Shift+B (and `/bg`) now background ALL running foreground commands, not just the most recent one.
 - CC-exact user-facing strings throughout (manual background, `jobs kill`, unknown-id errors, completion summaries, stall warnings); timeout kills log `Command timed out after Ns` so the model can tell a timeout kill from a failure.
 
@@ -254,7 +224,7 @@ A completion notice would fire even after the agent had already learned the job'
 ### 1.1.1 — Parity fixes, no-data-loss, live progress
 
 - **Live progress in the sidebar.** A running job's pill now shows its **latest output line** (refreshed every second), not just the command — so a long poll/build shows progress at a glance (`◉ qdrant: {"indexed":8540629,"status":"grey"} (2m10s)`). ANSI/control sequences are stripped so the widget stays clean and can't be escape-injected.
-- **No more lingering `sleep` jobs.** A naive `sleep N` wait (even embedded — `cd x; sleep 600; check`, newline-separated, or backgrounded) is now blocked in both `bash` and `bash_bg`, with steering to the tool that ends when the work does: `jobs attach`, the `monitor` tool, or an `until` loop. Sleeps inside real polling loops are never flagged.
+- **No more lingering `sleep` jobs.** A naive `sleep N` wait (even embedded — `cd x; sleep 600; check`, newline-separated, or backgrounded) is now blocked in `bash`, with steering to the tool that ends when the work does: `jobs attach`, the `monitor` tool, or an `until` loop. Sleeps inside real polling loops are never flagged.
 - **Claude Code parity on cancel (verified against CC source).** Pressing **Esc** kills the running foreground command (a deliberate cancel), while typing a new message, **Ctrl+Shift+B**, or the auto-background timeout move it to the background instead — exactly CC's `user-cancel` vs `interrupt` behavior. Long work is protected by auto-backgrounding at the timeout + `run_in_background`, not by ignoring a cancel.
 
 ### 1.1.7 — Ctrl+Shift+B (pi reserved-keybinding fix)
@@ -285,7 +255,6 @@ The big one. The background engine was rewritten from the ground up to match Cla
 
 **Highlights**
 - New `run_in_background: true` parameter on the `bash` tool.
-- `agent_bg` now streams progress live and resolves the `pi` binary path (so it works even outside standard `$PATH` installs).
 - Cooperative steering delivers your message as a follow-up turn — no polling loop.
 - Concurrency cap of 16 simultaneous background jobs.
 - Code and UI are English-only.
