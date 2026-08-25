@@ -32,6 +32,7 @@ interface MonitorParams {
     ws?: WsSpec;
     description: string;
     persistent?: boolean;
+    steer?: boolean;
     timeout_ms?: number;
 }
 
@@ -43,7 +44,9 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             "Stream events from a long-running process: each stdout line (or WebSocket " +
             "text frame) becomes one notification, delivered while you keep working. " +
             "Use this for per-event streams — NOT for one-shot 'wait until done' (use " +
-            "bash run_in_background for that). Exit ends the watch.",
+            "bash run_in_background for that). Exit ends the watch. Set steer:true to " +
+            "deliver each event as a steering notification that starts its own agent turn " +
+            "even while idle (default false: events wait for the next natural turn).",
         promptSnippet:
             "Stream per-event notifications from a process, log, poll loop, or WebSocket",
         promptGuidelines: [
@@ -55,6 +58,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             "Give a specific description — it is shown on every notification.",
             "Use persistent:true for session-length watches (PR monitoring, log tails); stop it with the jobs tool (action='kill').",
             "Use the ws source for a WebSocket feed instead of `command: 'websocat …'` — each text frame becomes one event.",
+            "Use steer:true when the agent must act on events without the user typing (unattended PR/CI watches); each event then starts its own turn. Keep the default for watches folded into ongoing work.",
         ],
         parameters: Type.Object({
             command: Type.Optional(
@@ -72,6 +76,13 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             description: Type.String({ description: "Specific description, shown on every notification." }),
             persistent: Type.Optional(
                 Type.Boolean({ description: "Run for the whole session (no timeout). Stop via jobs action='kill'. Default false." })
+            ),
+            steer: Type.Optional(
+                Type.Boolean({
+                    description:
+                        "Deliver each stream event as a steering notification that starts its own agent turn " +
+                        "even while idle. Default false: events are passive and surface on the next natural turn.",
+                })
             ),
             timeout_ms: Type.Optional(
                 Type.Number({ description: "Kill after this deadline (default 300000, max 3600000). Ignored when persistent." })
@@ -105,6 +116,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
 
             const description = p.description.trim();
             const persistent = p.persistent === true;
+            const steer = p.steer === true;
             const timeoutMs = Math.min(
                 p.timeout_ms && p.timeout_ms > 0 ? p.timeout_ms : MONITOR_DEFAULT_TIMEOUT_MS,
                 MONITOR_MAX_TIMEOUT_MS
@@ -143,6 +155,7 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
                 source,
                 description,
                 persistent,
+                steer,
                 timeoutMs,
             });
 
@@ -150,10 +163,11 @@ export function registerMonitorTool(pi: ExtensionAPI, reg: BackgroundRegistry): 
             const deadlineDesc = persistent
                 ? "persistent (stop via jobs action='kill')"
                 : `timeout ${Math.round(timeoutMs / 1000)}s`;
+            const steerDesc = steer ? ", steering (each event starts a turn)" : "";
             return {
                 content: [
                     textBlock(
-                        `Monitor ${id} started — ${sourceDesc}, ${deadlineDesc}. ` +
+                        `Monitor ${id} started — ${sourceDesc}, ${deadlineDesc}${steerDesc}. ` +
                             `Events ("${description}") will arrive as notifications. ` +
                             `Output: ${logPath}`
                     ),

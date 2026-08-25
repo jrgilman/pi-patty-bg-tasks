@@ -8,7 +8,7 @@ import { add, createRunningJob } from "../registry.ts";
 import { startMonitorSession } from "../monitor-session.ts";
 import type { MonitorSource } from "../monitor-source.ts";
 import type { SpawnExit } from "../spawn.ts";
-import { EVENT, type UiContext } from "../types.ts";
+import { EVENT, DELIVER_FOLLOWUP, DELIVER_STEER, type UiContext } from "../types.ts";
 
 const dir = join(tmpdir(), `pi-bg-session-${process.pid}`);
 mkdirSync(dir, { recursive: true });
@@ -20,9 +20,20 @@ interface Msg {
     details?: { terminal?: boolean };
 }
 
+interface Delivery {
+    deliverAs: string;
+    triggerTurn: boolean;
+}
+
 function harness(logPath: string) {
     const messages: Msg[] = [];
-    const pi = { sendMessage: (m: Msg) => messages.push(m) };
+    const streamDeliveries: Delivery[] = [];
+    const pi = {
+        sendMessage: (m: Msg, d?: Delivery) => {
+            messages.push(m);
+            if (m.customType === EVENT.monitorEvent && d) streamDeliveries.push(d);
+        },
+    };
     const ctx = {
         ui: { notify() {}, setWidget() {}, setStatus() {}, theme: { fg: (_c: string, t: string) => t } },
     } as unknown as UiContext;
@@ -54,7 +65,7 @@ function harness(logPath: string) {
     });
     add(reg, job);
 
-    const start = (over?: { persistent?: boolean; timeoutMs?: number }) =>
+    const start = (over?: { persistent?: boolean; timeoutMs?: number; steer?: boolean }) =>
         startMonitorSession({
             pi: pi as never,
             reg,
@@ -63,6 +74,7 @@ function harness(logPath: string) {
             source,
             description: "watch",
             persistent: over?.persistent ?? false,
+            steer: over?.steer ?? false,
             timeoutMs: over?.timeoutMs ?? 60_000,
         });
 
@@ -71,7 +83,7 @@ function harness(logPath: string) {
     const terminals = () => messages.filter((m) => m.customType === EVENT.taskNotification);
     const allText = () => messages.map((m) => m.content).join("\n");
 
-    return { messages, reg, job, start, resolveExit, isStopped: () => stopped, terminals, allText };
+    return { messages, streamDeliveries, reg, job, start, resolveExit, isStopped: () => stopped, terminals, allText };
 }
 
 void describe("monitor-session — lifecycle via a fake source", () => {
@@ -143,6 +155,34 @@ void describe("monitor-session — lifecycle via a fake source", () => {
         h.resolveExit({ code: 1, signal: null }); // ignored — promise already settled
         await sleep(40);
         assert.equal(h.terminals().length, 1);
+    });
+
+    void it("delivers stream events as passive follow-ups by default", async () => {
+        const logPath = join(dir, "followup.log");
+        writeFileSync(logPath, "");
+        const h = harness(logPath);
+        h.start();
+        appendFileSync(logPath, "line-A\n");
+        await sleep(300);
+
+        assert.ok(h.streamDeliveries.length > 0);
+        for (const d of h.streamDeliveries) {
+            assert.deepEqual(d, DELIVER_FOLLOWUP);
+        }
+    });
+
+    void it("delivers stream events as steering turns when steer is set", async () => {
+        const logPath = join(dir, "steer.log");
+        writeFileSync(logPath, "");
+        const h = harness(logPath);
+        h.start({ steer: true });
+        appendFileSync(logPath, "line-A\n");
+        await sleep(300);
+
+        assert.ok(h.streamDeliveries.length > 0);
+        for (const d of h.streamDeliveries) {
+            assert.deepEqual(d, DELIVER_STEER);
+        }
     });
 });
 

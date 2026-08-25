@@ -13,6 +13,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { BackgroundRegistry } from "./state.ts";
 import {
     DELIVER_FOLLOWUP,
+    DELIVER_STEER,
     EVENT,
     MONITOR_MAX_LINES_PER_WINDOW,
     MONITOR_RATE_WINDOW_MS,
@@ -38,9 +39,10 @@ export function startMonitorSession(args: {
     source: MonitorSource;
     description: string;
     persistent: boolean;
+    steer: boolean;
     timeoutMs: number;
 }): void {
-    const { pi, reg, ctx, job, source, description, persistent, timeoutMs } = args;
+    const { pi, reg, ctx, job, source, description, persistent, steer, timeoutMs } = args;
     const { id, logPath } = job;
 
     let terminalEmitted = false;
@@ -48,11 +50,17 @@ export function startMonitorSession(args: {
     let windowStart = Date.now();
     let windowLines = 0;
 
-    // Stream events stay live but passive (delivered as a follow-up, no wake) —
-    // they carry data the agent is actively watching and surface on the agent's
-    // next natural turn without spawning an unsolicited one. The terminal
-    // notice (stream ended / stopped / failed) is its own <task-notification>
-    // (see finishMonitor), sent the moment the source ends.
+    const streamDelivery = steer ? DELIVER_STEER : DELIVER_FOLLOWUP;
+
+    // Stream events stay live. By default they are passive (delivered as a
+    // follow-up, no wake) — they carry data the agent is actively watching and
+    // surface on the agent's next natural turn without spawning an unsolicited
+    // one. With steer:true the agent asked to be acted on by events themselves
+    // (unattended watches such as PR CI/reviews), so each event is delivered as
+    // a steering notification that starts its own turn even while idle. The
+    // terminal notice (stream ended / stopped / failed) is its own
+    // <task-notification> either way (see finishMonitor), sent the moment the
+    // source ends.
     const emitEvent = (lines: string[]): void => {
         if (lines.length === 0) return;
         pi.sendMessage(
@@ -62,7 +70,7 @@ export function startMonitorSession(args: {
                 display: true,
                 details: { jobId: id, description, logPath, terminal: false },
             },
-            DELIVER_FOLLOWUP
+            streamDelivery
         );
     };
 
