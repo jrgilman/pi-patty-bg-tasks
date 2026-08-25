@@ -13,6 +13,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { BackgroundRegistry } from "./state.ts";
 import { detectNonInteractive, terminateJobSilently } from "./lifecycle.ts";
 import { stopSidebarTicker } from "./registry.ts";
@@ -64,7 +65,10 @@ export default function (pi: ExtensionAPI): void {
                   ? "error"
                   : "warning";
         const line = theme.fg(colour, `● ${details?.summary ?? String(message.content)}`);
-        return { render: () => [line], invalidate: () => {} };
+        return {
+            render: (width: number) => [truncateToWidth(line, width)],
+            invalidate: () => {},
+        };
     };
     pi.registerMessageRenderer(EVENT.taskNotification, (message, _options, theme) =>
         renderTaskNotification(message, theme)
